@@ -1,0 +1,99 @@
+{
+  "project": {
+    "name": "Interclaude",
+    "description": "Cross-Machine Claude Code Bridge",
+    "language": "Rust",
+    "edition": "2024",
+    "version": "0.1.0",
+    "binary": "target/debug/interclaude",
+    "plan": "/Users/titus/.claude/plans/nested-humming-waffle.md"
+  },
+  "architecture": {
+    "pattern": "Master/Slave bridge over SSH/MOSH",
+    "machines": ["Mac (local)", "Linux VPS (remote)"],
+    "transports": {
+      "rsync": {"hotkey": "1", "latency": "2-5s", "reliability": "high"},
+      "mcp": {"hotkey": "2", "latency": "0.5s", "reliability": "medium"},
+      "redis": {"hotkey": "3", "latency": "<0.1s", "reliability": "medium"}
+    },
+    "connection_types": ["MOSH (recommended)", "SSH"],
+    "message_format": "JSON + UUIDv7",
+    "dedup": ".ledger append-only file",
+    "delivery_stages": [
+      "delivered", "read", "executing", "executed",
+      "replying", "receiving_reply", "received_reply"
+    ]
+  },
+  "phases": {
+    "1": {"name": "Project Scaffold + TUI Shell", "status": "COMPLETE"},
+    "2": {"name": "Setup Page (SSH + Config)", "status": "COMPLETE"},
+    "3": {"name": "Bridge Core (Connection + Sync)", "status": "COMPLETE"},
+    "4": {"name": "Transport Trait + rsync Pathway", "status": "COMPLETE"},
+    "5": {"name": "MCP Pathway", "status": "COMPLETE"},
+    "6": {"name": "Redis Pub/Sub Pathway", "status": "COMPLETE"},
+    "7": {"name": "Transport Selector + Switching", "status": "COMPLETE"},
+    "8": {"name": "Claude Code Session Management", "status": "COMPLETE"},
+    "9": {"name": "Bridge TUI (Live Monitoring)", "status": "COMPLETE"},
+    "10": {"name": "Role Negotiation (Master/Slave)", "status": "COMPLETE"}
+  },
+  "files": {
+    "src/main.rs": "Entry point, CLI, --slave headless mode",
+    "src/app.rs": "App state machine, DeliveryStatus, compose mode",
+    "src/config/mod.rs": "Exports Settings, ConnectionKind, Role",
+    "src/config/settings.rs": "Config persistence, SSH helpers",
+    "src/tui/mod.rs": "TUI loop, input handling, bridge engine lifecycle",
+    "src/tui/welcome.rs": "ASCII logo, dependency preflight",
+    "src/tui/setup.rs": "10-field config form",
+    "src/tui/bridge.rs": "Live bridge view with compose, pipeline, log",
+    "src/transport/mod.rs": "Transport trait, TransportKind, TransportSelector",
+    "src/transport/rsync_transport.rs": "rsync file-based transport",
+    "src/transport/mcp_transport.rs": "MCP JSON-RPC transport + server",
+    "src/transport/redis_transport.rs": "Redis Pub/Sub transport",
+    "src/transport/dedup.rs": "Deduplication ledger",
+    "src/transport/status.rs": "Delivery status tracker",
+    "src/bridge/mod.rs": "Bridge module exports",
+    "src/bridge/connection.rs": "SSH/MOSH test, dir setup, autossh",
+    "src/bridge/engine.rs": "BridgeEngine: transport lifecycle",
+    "src/bridge/handshake.rs": "Role negotiation protocol",
+    "src/bridge/message.rs": "Message format, UUIDv7",
+    "src/bridge/session.rs": "Remote claude exec, slave watcher",
+    "src/bridge/sync.rs": "rsync push/pull, ledger/status sync",
+    "src/bridge/watcher.rs": "FileWatcher + PollingWatcher",
+    "scripts/slave-watcher.sh": "Standalone slave watcher (bash)",
+    "scripts/install-deps.sh": "Dependency checker/installer"
+  },
+  "dependencies": {
+    "ratatui": "0.29",
+    "crossterm": "0.28",
+    "tokio": "1 (full)",
+    "serde": "1 (derive)",
+    "serde_json": "1",
+    "toml": "0.8",
+    "clap": "4 (derive)",
+    "uuid": "1 (v7)",
+    "redis": "0.27 (tokio-comp, aio)",
+    "futures-lite": "2",
+    "anyhow": "1",
+    "thiserror": "2",
+    "chrono": "0.4 (serde)",
+    "dirs": "6",
+    "hostname": "0.4"
+  },
+  "build_notes": {
+    "macos_fix": ".cargo/config.toml sets LIBRARY_PATH for libiconv",
+    "rust_version": "1.93.1",
+    "warnings": "39 (all unused - expected)",
+    "binary_runs": true
+  },
+  "key_decisions": [
+    "MOSH recommended over SSH (survives roaming, UDP, auto-reconnect)",
+    "All 3 transports user-selectable at any time",
+    "Every transport writes files for audit trail",
+    "Single .ledger for dedup across all transports",
+    "Only ONE transport active at a time",
+    "7-stage delivery tracking pipeline",
+    "UUIDv7 for time-sortable message IDs",
+    "Transport switch: announce->activate->health_check->rollback (10s)",
+    "Role negotiation: first initiator = master, tie-break by machine_id"
+  ]
+}

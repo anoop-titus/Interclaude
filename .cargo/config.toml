@@ -1,0 +1,2 @@
+[env]
+LIBRARY_PATH = "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib"
