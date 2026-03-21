@@ -17,6 +17,7 @@ use tokio::sync::mpsc;
 use crate::app::{App, DeliveryStatus, Page, SetupField};
 use crate::bridge::connection;
 use crate::bridge::engine::{BridgeEngine, BridgeEvent};
+use crate::config::Role;
 use crate::transport::TransportKind;
 
 pub async fn run(app: &mut App) -> Result<()> {
@@ -47,6 +48,8 @@ async fn run_loop(
 ) -> Result<()> {
     let mut bridge_engine: Option<Arc<BridgeEngine>> = None;
     let mut event_rx: Option<mpsc::Receiver<BridgeEvent>> = None;
+    // Keep tunnel handle alive so it doesn't get dropped
+    let mut _tunnel_handle: Option<tokio::process::Child> = None;
 
     while app.running {
         // Process bridge events if engine is running
@@ -71,10 +74,35 @@ async fn run_loop(
                             match BridgeEngine::new(app.settings.clone(), tx) {
                                 Ok(engine) => {
                                     let engine = Arc::new(engine);
+
+                                    // Start autossh tunnel
+                                    match engine.start_tunnel().await {
+                                        Ok(child) => {
+                                            _tunnel_handle = child;
+                                        }
+                                        Err(e) => {
+                                            app.bridge_log.push(format!("Tunnel failed: {e} (continuing)"));
+                                        }
+                                    }
+
                                     // Start background tasks
                                     engine.start_health_monitor();
                                     engine.start_receive_loop();
                                     engine.start_heartbeat();
+
+                                    // Start Redis subscriber if needed
+                                    engine.start_redis_subscriber_if_active();
+
+                                    // Send handshake
+                                    {
+                                        let eng = engine.clone();
+                                        tokio::spawn(async move {
+                                            if let Err(e) = eng.send_handshake().await {
+                                                eprintln!("Handshake send failed: {e}");
+                                            }
+                                        });
+                                    }
+
                                     bridge_engine = Some(engine);
                                     event_rx = Some(rx);
                                     app.connection_status = "Connecting...".to_string();
@@ -139,6 +167,10 @@ fn process_bridge_event(app: &mut App, event: BridgeEvent) {
         BridgeEvent::MessageReceived(entry) => {
             app.messages.push(entry);
         }
+        BridgeEvent::CommandReceived(_msg) => {
+            // In TUI mode (master), we don't execute commands locally
+            // This is handled by the slave's event loop in main.rs
+        }
         BridgeEvent::HealthUpdate(kind, healthy) => {
             let idx = match kind {
                 TransportKind::Rsync => 0,
@@ -167,6 +199,10 @@ fn process_bridge_event(app: &mut App, event: BridgeEvent) {
         }
         BridgeEvent::TransportSwitched(kind) => {
             app.active_transport = kind;
+        }
+        BridgeEvent::RoleConfirmed(role) => {
+            app.bridge_log.push(format!("Role confirmed: {:?}", role));
+            app.connection_status = format!("Connected ({:?})", role);
         }
     }
 }

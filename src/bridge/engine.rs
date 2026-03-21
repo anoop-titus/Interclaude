@@ -5,8 +5,10 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 
 use crate::app::{DeliveryStatus, MessageDirection, MessageEntry};
-use crate::bridge::message::{Message, MessagePayload, MessageType};
-use crate::bridge::watcher::{PollingWatcher, WatchEvent};
+use crate::bridge::handshake::{Handshake, HandshakeResponse};
+use crate::bridge::message::{
+    CommandPayload, Message, MessagePayload, MessageType, ResponsePayload, StatusPayload,
+};
 use crate::config::{Role, Settings};
 use crate::transport::dedup::DedupLedger;
 use crate::transport::mcp_transport::McpTransport;
@@ -22,6 +24,8 @@ pub enum BridgeEvent {
     MessageSent(MessageEntry),
     /// A new message was received
     MessageReceived(MessageEntry),
+    /// A command was received (slave needs full message to execute)
+    CommandReceived(Message),
     /// Transport health updated
     HealthUpdate(TransportKind, bool),
     /// Connection status changed
@@ -32,6 +36,15 @@ pub enum BridgeEvent {
     Log(String),
     /// Transport switched
     TransportSwitched(TransportKind),
+    /// Role confirmed via handshake
+    RoleConfirmed(Role),
+}
+
+/// Persistent transport instances so connections aren't recreated every loop
+struct Transports {
+    rsync: RsyncTransport,
+    mcp: McpTransport,
+    redis: RedisTransport,
 }
 
 /// The bridge engine manages transports, message flow, and session lifecycle
@@ -43,6 +56,9 @@ pub struct BridgeEngine {
     status_tracker: Arc<StatusTracker>,
     sequence: Arc<Mutex<u64>>,
     session_id: String,
+    transports: Arc<Transports>,
+    handshake: Arc<Mutex<Handshake>>,
+    role: Arc<Mutex<Role>>,
 }
 
 impl BridgeEngine {
@@ -53,6 +69,15 @@ impl BridgeEngine {
         let selector = TransportSelector::new(settings.active_transport);
         let session_id = uuid::Uuid::now_v7().to_string();
 
+        let transports = Transports {
+            rsync: RsyncTransport::new(&settings),
+            mcp: McpTransport::new(&settings),
+            redis: RedisTransport::new(&settings, &session_id),
+        };
+
+        let role = settings.role;
+        let handshake = Handshake::new(&session_id);
+
         Ok(Self {
             settings,
             event_tx,
@@ -61,6 +86,9 @@ impl BridgeEngine {
             status_tracker: Arc::new(status_tracker),
             sequence: Arc::new(Mutex::new(0)),
             session_id,
+            transports: Arc::new(transports),
+            handshake: Arc::new(Mutex::new(handshake)),
+            role: Arc::new(Mutex::new(role)),
         })
     }
 
@@ -76,10 +104,15 @@ impl BridgeEngine {
         self.selector.lock().await.active
     }
 
+    /// Get current role
+    pub async fn current_role(&self) -> Role {
+        *self.role.lock().await
+    }
+
     /// Send a command message using the active transport
     pub async fn send_command(&self, task: String) -> Result<String> {
         let seq = self.next_seq().await;
-        let role = match self.settings.role {
+        let role = match *self.role.lock().await {
             Role::Master => "master",
             Role::Slave => "slave",
         };
@@ -106,23 +139,125 @@ impl BridgeEngine {
         Ok(msg_id)
     }
 
+    /// Send a response message back (used by slave after executing a command)
+    pub async fn send_response(
+        &self,
+        reply_to: &str,
+        stdout: String,
+        stderr: String,
+        exit_code: i32,
+        duration_ms: u64,
+    ) -> Result<()> {
+        let seq = self.next_seq().await;
+        let role = match *self.role.lock().await {
+            Role::Master => "master",
+            Role::Slave => "slave",
+        };
+        let active = self.active_transport().await;
+
+        let msg = Message {
+            msg_id: uuid::Uuid::now_v7().to_string(),
+            msg_type: MessageType::Response,
+            timestamp: chrono::Utc::now(),
+            sequence: seq,
+            sender_role: role.to_string(),
+            transport_used: active.label().to_string(),
+            payload: MessagePayload::Response(ResponsePayload {
+                reply_to: reply_to.to_string(),
+                stdout,
+                stderr,
+                exit_code,
+                files_modified: vec![],
+                duration_ms,
+            }),
+        };
+
+        self.send_via_active(&msg).await?;
+
+        let entry = MessageEntry {
+            msg_id: msg.msg_id.clone(),
+            timestamp: chrono::Utc::now().format("%H:%M:%S").to_string(),
+            direction: MessageDirection::Outbound,
+            content_preview: msg.preview(),
+            status: DeliveryStatus::Replying,
+        };
+        let _ = self.event_tx.send(BridgeEvent::MessageSent(entry)).await;
+
+        Ok(())
+    }
+
+    /// Send a status update message for a given msg_id
+    pub async fn send_status_update(&self, ref_msg_id: &str, status: DeliveryStatus) -> Result<()> {
+        let seq = self.next_seq().await;
+        let role = match *self.role.lock().await {
+            Role::Master => "master",
+            Role::Slave => "slave",
+        };
+        let active = self.active_transport().await;
+
+        let msg = Message {
+            msg_id: uuid::Uuid::now_v7().to_string(),
+            msg_type: MessageType::Status,
+            timestamp: chrono::Utc::now(),
+            sequence: seq,
+            sender_role: role.to_string(),
+            transport_used: active.label().to_string(),
+            payload: MessagePayload::Status(StatusPayload {
+                ref_msg_id: ref_msg_id.to_string(),
+                status: status.label().to_string(),
+            }),
+        };
+
+        // Best-effort — don't fail the whole operation if status send fails
+        let _ = self.send_via_active(&msg).await;
+
+        Ok(())
+    }
+
+    /// Send the handshake proposal on startup
+    pub async fn send_handshake(&self) -> Result<()> {
+        let desired_role = *self.role.lock().await;
+        let proposal = {
+            let mut hs = self.handshake.lock().await;
+            hs.create_proposal(desired_role)
+        };
+
+        let _ = self.event_tx.send(BridgeEvent::Log(
+            format!("Sending handshake proposal as {:?}", desired_role)
+        )).await;
+
+        self.send_via_active(&proposal).await?;
+        Ok(())
+    }
+
     /// Send a message via the currently active transport
     async fn send_via_active(&self, msg: &Message) -> Result<()> {
         let active = self.active_transport().await;
         match active {
-            TransportKind::Rsync => {
-                let transport = RsyncTransport::new(&self.settings);
-                transport.send(msg).await
-            }
-            TransportKind::Mcp => {
-                let transport = McpTransport::new(&self.settings);
-                transport.send(msg).await
-            }
-            TransportKind::Redis => {
-                let transport = RedisTransport::new(&self.settings, &self.session_id);
-                transport.send(msg).await
-            }
+            TransportKind::Rsync => self.transports.rsync.send(msg).await,
+            TransportKind::Mcp => self.transports.mcp.send(msg).await,
+            TransportKind::Redis => self.transports.redis.send(msg).await,
         }
+    }
+
+    /// Start the Redis subscriber if Redis is the active transport
+    pub fn start_redis_subscriber_if_active(&self) {
+        let transports = self.transports.clone();
+        let selector = self.selector.clone();
+        let event_tx = self.event_tx.clone();
+
+        tokio::spawn(async move {
+            let active = selector.lock().await.active;
+            if active == TransportKind::Redis {
+                let _ = event_tx.send(BridgeEvent::Log(
+                    "Starting Redis subscriber...".to_string()
+                )).await;
+                transports.redis.start_subscriber();
+                let _ = event_tx.send(BridgeEvent::Log(
+                    "Redis subscriber started".to_string()
+                )).await;
+            }
+        });
     }
 
     /// Switch to a different transport
@@ -138,7 +273,7 @@ impl BridgeEngine {
 
         // Send transport_switch announcement on current transport
         let seq = self.next_seq().await;
-        let role = match self.settings.role {
+        let role = match *self.role.lock().await {
             Role::Master => "master",
             Role::Slave => "slave",
         };
@@ -164,6 +299,14 @@ impl BridgeEngine {
         {
             let mut selector = self.selector.lock().await;
             selector.set_active(new_kind);
+        }
+
+        // If switching TO Redis, start the subscriber
+        if new_kind == TransportKind::Redis {
+            let _ = self.event_tx.send(BridgeEvent::Log(
+                "Starting Redis subscriber for new transport...".to_string()
+            )).await;
+            self.transports.redis.start_subscriber();
         }
 
         // Health check on new transport with 10s timeout
@@ -195,18 +338,9 @@ impl BridgeEngine {
     /// Health check a specific transport
     async fn check_health(&self, kind: TransportKind) -> bool {
         let result = match kind {
-            TransportKind::Rsync => {
-                let t = RsyncTransport::new(&self.settings);
-                t.health_check().await
-            }
-            TransportKind::Mcp => {
-                let t = McpTransport::new(&self.settings);
-                t.health_check().await
-            }
-            TransportKind::Redis => {
-                let t = RedisTransport::new(&self.settings, &self.session_id);
-                t.health_check().await
-            }
+            TransportKind::Rsync => self.transports.rsync.health_check().await,
+            TransportKind::Mcp => self.transports.mcp.health_check().await,
+            TransportKind::Redis => self.transports.redis.health_check().await,
         };
 
         let healthy = result.unwrap_or(false);
@@ -218,27 +352,17 @@ impl BridgeEngine {
 
     /// Run periodic health checks for all transports
     pub fn start_health_monitor(&self) -> JoinHandle<()> {
-        let settings = self.settings.clone();
+        let transports = self.transports.clone();
         let selector = self.selector.clone();
         let event_tx = self.event_tx.clone();
-        let session_id = self.session_id.clone();
 
         tokio::spawn(async move {
             loop {
                 for kind in [TransportKind::Rsync, TransportKind::Mcp, TransportKind::Redis] {
                     let healthy = match kind {
-                        TransportKind::Rsync => {
-                            let t = RsyncTransport::new(&settings);
-                            t.health_check().await.unwrap_or(false)
-                        }
-                        TransportKind::Mcp => {
-                            let t = McpTransport::new(&settings);
-                            t.health_check().await.unwrap_or(false)
-                        }
-                        TransportKind::Redis => {
-                            let t = RedisTransport::new(&settings, &session_id);
-                            t.health_check().await.unwrap_or(false)
-                        }
+                        TransportKind::Rsync => transports.rsync.health_check().await.unwrap_or(false),
+                        TransportKind::Mcp => transports.mcp.health_check().await.unwrap_or(false),
+                        TransportKind::Redis => transports.redis.health_check().await.unwrap_or(false),
                     };
 
                     selector.lock().await.update_health(kind, healthy);
@@ -252,31 +376,23 @@ impl BridgeEngine {
 
     /// Start polling for incoming messages on the active transport
     pub fn start_receive_loop(&self) -> JoinHandle<()> {
-        let settings = self.settings.clone();
+        let transports = self.transports.clone();
         let selector = self.selector.clone();
         let ledger = self.ledger.clone();
         let status_tracker = self.status_tracker.clone();
         let event_tx = self.event_tx.clone();
-        let session_id = self.session_id.clone();
         let sync_interval = self.settings.sync_interval_secs;
+        let handshake = self.handshake.clone();
+        let role = self.role.clone();
 
         tokio::spawn(async move {
             loop {
                 let active = selector.lock().await.active;
 
                 let messages = match active {
-                    TransportKind::Rsync => {
-                        let t = RsyncTransport::new(&settings);
-                        t.receive().await.unwrap_or_default()
-                    }
-                    TransportKind::Mcp => {
-                        let t = McpTransport::new(&settings);
-                        t.receive().await.unwrap_or_default()
-                    }
-                    TransportKind::Redis => {
-                        let t = RedisTransport::new(&settings, &session_id);
-                        t.receive().await.unwrap_or_default()
-                    }
+                    TransportKind::Rsync => transports.rsync.receive().await.unwrap_or_default(),
+                    TransportKind::Mcp => transports.mcp.receive().await.unwrap_or_default(),
+                    TransportKind::Redis => transports.redis.receive().await.unwrap_or_default(),
                 };
 
                 for msg in messages {
@@ -291,6 +407,55 @@ impl BridgeEngine {
 
                     // Process based on message type
                     match msg.msg_type {
+                        MessageType::Command => {
+                            // First check if this is a handshake message
+                            let hs_response = {
+                                let mut hs = handshake.lock().await;
+                                hs.process_handshake(&msg)
+                            };
+
+                            match hs_response {
+                                Ok(HandshakeResponse::Accepted(assigned_role)) => {
+                                    *role.lock().await = assigned_role;
+                                    let _ = event_tx.send(BridgeEvent::RoleConfirmed(assigned_role)).await;
+                                    let _ = event_tx.send(BridgeEvent::Log(
+                                        format!("Handshake: role confirmed as {:?}", assigned_role)
+                                    )).await;
+                                }
+                                Ok(HandshakeResponse::AlreadyConfirmed(r)) => {
+                                    let _ = event_tx.send(BridgeEvent::Log(
+                                        format!("Handshake: already confirmed as {:?}", r)
+                                    )).await;
+                                }
+                                Ok(HandshakeResponse::Error(e)) => {
+                                    let _ = event_tx.send(BridgeEvent::Log(
+                                        format!("Handshake error: {}", e)
+                                    )).await;
+                                }
+                                Ok(HandshakeResponse::NotHandshake) => {
+                                    // Regular command — emit for slave processing
+                                    let current_role = *role.lock().await;
+                                    if current_role == Role::Slave {
+                                        // Slave receives a command to execute
+                                        let _ = event_tx.send(BridgeEvent::CommandReceived(msg.clone())).await;
+                                    }
+
+                                    let entry = MessageEntry {
+                                        msg_id: msg.msg_id.clone(),
+                                        timestamp: chrono::Utc::now().format("%H:%M:%S").to_string(),
+                                        direction: MessageDirection::Inbound,
+                                        content_preview: msg.preview(),
+                                        status: DeliveryStatus::Read,
+                                    };
+                                    let _ = event_tx.send(BridgeEvent::MessageReceived(entry)).await;
+                                }
+                                Err(e) => {
+                                    let _ = event_tx.send(BridgeEvent::Log(
+                                        format!("Handshake parse error: {}", e)
+                                    )).await;
+                                }
+                            }
+                        }
                         MessageType::Response => {
                             // Update status of the original command
                             if let MessagePayload::Response(ref resp) = msg.payload {
@@ -328,9 +493,32 @@ impl BridgeEngine {
                             }
                         }
                         MessageType::TransportSwitch => {
-                            let _ = event_tx.send(BridgeEvent::Log(
-                                format!("Remote requested transport switch: {}", msg.preview())
-                            )).await;
+                            // Remote side is switching transports — follow suit
+                            if let MessagePayload::TransportSwitch(ref sw) = msg.payload {
+                                let new_kind = match sw.to.as_str() {
+                                    "rsync" => Some(TransportKind::Rsync),
+                                    "MCP" => Some(TransportKind::Mcp),
+                                    "Redis" => Some(TransportKind::Redis),
+                                    _ => None,
+                                };
+                                if let Some(kind) = new_kind {
+                                    let mut sel = selector.lock().await;
+                                    sel.set_active(kind);
+                                    let _ = event_tx.send(BridgeEvent::TransportSwitched(kind)).await;
+                                    let _ = event_tx.send(BridgeEvent::Log(
+                                        format!("Followed remote transport switch to {}", kind.label())
+                                    )).await;
+
+                                    // Start Redis subscriber if switching to Redis
+                                    if kind == TransportKind::Redis {
+                                        transports.redis.start_subscriber();
+                                    }
+                                }
+                            } else {
+                                let _ = event_tx.send(BridgeEvent::Log(
+                                    format!("Remote requested transport switch: {}", msg.preview())
+                                )).await;
+                            }
                         }
                         MessageType::Heartbeat => {
                             // Update connection status
@@ -358,10 +546,10 @@ impl BridgeEngine {
 
     /// Start heartbeat sender
     pub fn start_heartbeat(&self) -> JoinHandle<()> {
-        let settings = self.settings.clone();
+        let transports = self.transports.clone();
         let selector = self.selector.clone();
-        let session_id = self.session_id.clone();
         let sequence = self.sequence.clone();
+        let role = self.role.clone();
 
         tokio::spawn(async move {
             loop {
@@ -373,26 +561,17 @@ impl BridgeEngine {
                 let seq_val = *seq;
                 drop(seq);
 
-                let role = match settings.role {
+                let role_str = match *role.lock().await {
                     Role::Master => "master",
                     Role::Slave => "slave",
                 };
 
-                let heartbeat = Message::new_heartbeat(seq_val, role, active.label());
+                let heartbeat = Message::new_heartbeat(seq_val, role_str, active.label());
 
                 let result = match active {
-                    TransportKind::Rsync => {
-                        let t = RsyncTransport::new(&settings);
-                        t.send(&heartbeat).await
-                    }
-                    TransportKind::Mcp => {
-                        let t = McpTransport::new(&settings);
-                        t.send(&heartbeat).await
-                    }
-                    TransportKind::Redis => {
-                        let t = RedisTransport::new(&settings, &session_id);
-                        t.send(&heartbeat).await
-                    }
+                    TransportKind::Rsync => transports.rsync.send(&heartbeat).await,
+                    TransportKind::Mcp => transports.mcp.send(&heartbeat).await,
+                    TransportKind::Redis => transports.redis.send(&heartbeat).await,
                 };
 
                 if result.is_err() {
@@ -418,5 +597,47 @@ impl BridgeEngine {
         )).await;
 
         Ok(child)
+    }
+
+    /// Start autossh tunnel for the current transport
+    pub async fn start_tunnel(&self) -> Result<Option<tokio::process::Child>> {
+        let active = self.active_transport().await;
+        match active {
+            TransportKind::Mcp => {
+                let _ = self.event_tx.send(BridgeEvent::Log(
+                    format!("Starting autossh tunnel for MCP (port {})...", self.settings.mcp_port)
+                )).await;
+                let child = crate::bridge::connection::start_autossh_tunnel(
+                    &self.settings,
+                    self.settings.mcp_port,
+                    self.settings.mcp_port,
+                ).await?;
+                let _ = self.event_tx.send(BridgeEvent::Log(
+                    "MCP tunnel started".to_string()
+                )).await;
+                Ok(Some(child))
+            }
+            TransportKind::Redis => {
+                let _ = self.event_tx.send(BridgeEvent::Log(
+                    format!("Starting autossh tunnel for Redis (port {})...", self.settings.redis.port)
+                )).await;
+                let child = crate::bridge::connection::start_autossh_tunnel(
+                    &self.settings,
+                    self.settings.redis.port,
+                    self.settings.redis.port,
+                ).await?;
+                let _ = self.event_tx.send(BridgeEvent::Log(
+                    "Redis tunnel started".to_string()
+                )).await;
+                Ok(Some(child))
+            }
+            TransportKind::Rsync => {
+                // rsync uses SSH directly, no tunnel needed
+                let _ = self.event_tx.send(BridgeEvent::Log(
+                    "rsync transport: no tunnel needed (uses SSH directly)".to_string()
+                )).await;
+                Ok(None)
+            }
+        }
     }
 }
