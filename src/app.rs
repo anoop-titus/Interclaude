@@ -29,13 +29,13 @@ pub enum DeliveryStatus {
 impl DeliveryStatus {
     pub fn label(&self) -> &'static str {
         match self {
-            Self::Delivered => "DELIVERED",
+            Self::Delivered => "SENT",
             Self::Read => "READ",
-            Self::Executing => "EXECUTING",
-            Self::Executed => "EXECUTED",
+            Self::Executing => "RUNNING",
+            Self::Executed => "DONE",
             Self::Replying => "REPLYING",
             Self::ReceivingReply => "RECEIVING",
-            Self::ReceivedReply => "RECEIVED",
+            Self::ReceivedReply => "COMPLETE",
             Self::DeliveryFailed => "FAILED",
             Self::ExecutionError => "ERROR",
             Self::Timeout => "TIMEOUT",
@@ -44,16 +44,30 @@ impl DeliveryStatus {
 
     pub fn symbol(&self) -> &'static str {
         match self {
-            Self::Delivered => ">>",
-            Self::Read => "()",
-            Self::Executing => "..",
-            Self::Executed => "OK",
-            Self::Replying => "<<",
-            Self::ReceivingReply => "<-",
-            Self::ReceivedReply => "++",
-            Self::DeliveryFailed => "XX",
-            Self::ExecutionError => "!!",
-            Self::Timeout => "??",
+            Self::Delivered => "→",
+            Self::Read => "◉",
+            Self::Executing => "⟳",
+            Self::Executed => "✓",
+            Self::Replying => "←",
+            Self::ReceivingReply => "⇐",
+            Self::ReceivedReply => "✔",
+            Self::DeliveryFailed => "✗",
+            Self::ExecutionError => "!",
+            Self::Timeout => "⏱",
+        }
+    }
+
+    /// Ordinal position in the pipeline (0-6 for normal flow)
+    pub fn ordinal(&self) -> usize {
+        match self {
+            Self::Delivered => 0,
+            Self::Read => 1,
+            Self::Executing => 2,
+            Self::Executed => 3,
+            Self::Replying => 4,
+            Self::ReceivingReply => 5,
+            Self::ReceivedReply => 6,
+            Self::DeliveryFailed | Self::ExecutionError | Self::Timeout => 99,
         }
     }
 }
@@ -161,6 +175,24 @@ impl SetupField {
     }
 }
 
+/// Which panel has focus on the Bridge page
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BridgeFocus {
+    Outbox,
+    Inbox,
+    Input,
+}
+
+impl BridgeFocus {
+    pub fn next(&self) -> Self {
+        match self {
+            Self::Outbox => Self::Inbox,
+            Self::Inbox => Self::Input,
+            Self::Input => Self::Outbox,
+        }
+    }
+}
+
 /// Central application state
 pub struct App {
     pub page: Page,
@@ -187,6 +219,18 @@ pub struct App {
     pub selected_message: Option<usize>,
     pub bridge_log: Vec<String>,
     pub bridge_log_scroll: u16,
+    pub bridge_focus: BridgeFocus,
+    pub outbox_scroll: usize,
+    pub inbox_scroll: usize,
+
+    // Collapsible panels (Plan 11-05)
+    pub show_status_panel: bool,
+    pub show_pipeline_panel: bool,
+    pub transport_recommendation: Option<(TransportKind, String)>,
+
+    // Help overlay (Plan 11-04)
+    pub show_help_overlay: bool,
+    pub connected_at: Option<std::time::Instant>,
 
     // Command input (always visible on Bridge page)
     pub compose_input: String,
@@ -220,6 +264,14 @@ impl App {
             selected_message: None,
             bridge_log: Vec::new(),
             bridge_log_scroll: 0,
+            bridge_focus: BridgeFocus::Input,
+            outbox_scroll: 0,
+            inbox_scroll: 0,
+            show_status_panel: true,
+            show_pipeline_panel: true,
+            transport_recommendation: None,
+            show_help_overlay: false,
+            connected_at: None,
             compose_input: String::new(),
             tutorial_lines: vec![
                 "Pre-flight Installation Guide".to_string(),
@@ -334,5 +386,35 @@ impl App {
             ("Setup", Page::Setup, true),
             ("Bridge", Page::Bridge, self.ssh_test_passed),
         ]
+    }
+
+    /// Recalculate transport recommendation based on health
+    pub fn update_transport_recommendation(&mut self) {
+        // Priority: Redis (fastest) > MCP > rsync (most reliable fallback)
+        let candidates = [
+            (TransportKind::Redis, 2, "lowest latency"),
+            (TransportKind::Mcp, 1, "low latency"),
+            (TransportKind::Rsync, 0, "most reliable"),
+        ];
+
+        for (kind, idx, reason) in &candidates {
+            if self.transport_health[*idx] && self.active_transport != *kind {
+                self.transport_recommendation = Some((*kind, reason.to_string()));
+                return;
+            }
+        }
+
+        // Current transport is already the best, or nothing healthy
+        self.transport_recommendation = None;
+    }
+
+    /// Session duration as HH:MM string
+    pub fn session_duration(&self) -> Option<String> {
+        self.connected_at.map(|start| {
+            let elapsed = start.elapsed();
+            let mins = elapsed.as_secs() / 60;
+            let hours = mins / 60;
+            format!("{:02}:{:02}", hours, mins % 60)
+        })
     }
 }

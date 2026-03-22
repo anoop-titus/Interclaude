@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-use crate::app::{App, Page, SetupField};
+use crate::app::{App, BridgeFocus, MessageDirection, Page, SetupField};
 use crate::bridge::connection;
 use crate::bridge::engine::{BridgeEngine, BridgeEvent};
 use crate::transport::TransportKind;
@@ -394,12 +394,20 @@ fn process_bridge_event(app: &mut App, event: BridgeEvent) {
                 TransportKind::Redis => 2,
             };
             app.transport_health[idx] = healthy;
+            // Recalculate transport recommendation
+            app.update_transport_recommendation();
         }
         BridgeEvent::ConnectionStatus(status) => {
             if status.starts_with("Connected") {
+                if app.connected_at.is_none() {
+                    app.connected_at = Some(std::time::Instant::now());
+                }
                 app.connection_status = status;
             } else {
-                app.connection_status = status;
+                app.connection_status = status.clone();
+                if status == "Disconnected" || status.contains("failed") {
+                    app.connected_at = None;
+                }
                 if app.session_status.starts_with("Active") {
                     app.session_status = "Inactive".to_string();
                 }
@@ -472,7 +480,7 @@ async fn handle_input(app: &mut App, key: KeyCode, modifiers: KeyModifiers) -> I
     // Global Ctrl keybindings
     if modifiers.contains(KeyModifiers::CONTROL) {
         match key {
-            KeyCode::Char('q') => {
+            KeyCode::Char('q') | KeyCode::Char('c') => {
                 app.running = false;
                 return InputAction::None;
             }
@@ -485,16 +493,26 @@ async fn handle_input(app: &mut App, key: KeyCode, modifiers: KeyModifiers) -> I
                 }
                 return InputAction::None;
             }
+            KeyCode::Char('h') => {
+                if app.page == Page::Bridge {
+                    app.show_help_overlay = !app.show_help_overlay;
+                }
+                return InputAction::None;
+            }
             _ => {}
         }
     }
 
     match key {
         KeyCode::Esc => {
+            // Dismiss help overlay first
+            if app.show_help_overlay {
+                app.show_help_overlay = false;
+                return InputAction::None;
+            }
+            // Esc = back (no-op on Welcome — use Ctrl+Q to quit)
             if app.page != Page::Welcome {
                 app.prev_page();
-            } else {
-                app.running = false;
             }
             InputAction::None
         }
@@ -696,21 +714,59 @@ fn handle_bridge_input(app: &mut App, key: KeyCode, modifiers: KeyModifiers) -> 
             app.set_transport(TransportKind::Redis);
             InputAction::SwitchTransport(TransportKind::Redis)
         }
+        KeyCode::Tab => {
+            // Cycle focus: Outbox → Inbox → Input
+            app.bridge_focus = app.bridge_focus.next();
+            InputAction::None
+        }
+        KeyCode::F(5) => {
+            app.show_status_panel = !app.show_status_panel;
+            InputAction::None
+        }
         KeyCode::Up => {
-            if let Some(sel) = app.selected_message {
-                if sel > 0 {
-                    app.selected_message = Some(sel - 1);
+
+            match app.bridge_focus {
+                BridgeFocus::Outbox => {
+                    app.outbox_scroll = app.outbox_scroll.saturating_sub(1);
+                }
+                BridgeFocus::Inbox => {
+                    app.inbox_scroll = app.inbox_scroll.saturating_sub(1);
+                }
+                BridgeFocus::Input => {
+                    // Select message in outbox
+                    if let Some(sel) = app.selected_message {
+                        if sel > 0 {
+                            app.selected_message = Some(sel - 1);
+                        }
+                    }
                 }
             }
             InputAction::None
         }
         KeyCode::Down => {
-            if let Some(sel) = app.selected_message {
-                if sel < app.messages.len().saturating_sub(1) {
-                    app.selected_message = Some(sel + 1);
+
+            match app.bridge_focus {
+                BridgeFocus::Outbox => {
+                    let count = app.messages.iter().filter(|m| m.direction == MessageDirection::Outbound).count();
+                    if count > 0 {
+                        app.outbox_scroll = (app.outbox_scroll + 1).min(count.saturating_sub(1));
+                    }
                 }
-            } else if !app.messages.is_empty() {
-                app.selected_message = Some(0);
+                BridgeFocus::Inbox => {
+                    let count = app.messages.iter().filter(|m| m.direction == MessageDirection::Inbound).count();
+                    if count > 0 {
+                        app.inbox_scroll = (app.inbox_scroll + 1).min(count.saturating_sub(1));
+                    }
+                }
+                BridgeFocus::Input => {
+                    if let Some(sel) = app.selected_message {
+                        if sel < app.messages.len().saturating_sub(1) {
+                            app.selected_message = Some(sel + 1);
+                        }
+                    } else if !app.messages.is_empty() {
+                        app.selected_message = Some(0);
+                    }
+                }
             }
             InputAction::None
         }

@@ -216,7 +216,7 @@ fn draw_status_banner(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-fn draw_nav(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_nav(frame: &mut Frame, _app: &App, area: Rect) {
     let width = area.width;
 
     let nav_line = if width >= 50 {
