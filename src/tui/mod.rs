@@ -1,10 +1,11 @@
 mod bridge;
 mod setup;
+pub mod status_bar;
 mod welcome;
 
 use anyhow::Result;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyModifiers},
+    event::{self, Event, KeyCode, KeyModifiers, MouseEventKind, EnableMouseCapture, DisableMouseCapture},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -14,10 +15,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-use crate::app::{App, DeliveryStatus, Page, SetupField};
+use crate::app::{App, Page, SetupField};
 use crate::bridge::connection;
 use crate::bridge::engine::{BridgeEngine, BridgeEvent};
-use crate::config::Role;
 use crate::transport::TransportKind;
 
 pub async fn run(app: &mut App) -> Result<()> {
@@ -29,14 +29,14 @@ pub async fn run(app: &mut App) -> Result<()> {
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let result = run_loop(&mut terminal, app).await;
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
     terminal.show_cursor()?;
 
     result
@@ -49,105 +49,303 @@ async fn run_loop(
     let mut bridge_engine: Option<Arc<BridgeEngine>> = None;
     let mut event_rx: Option<mpsc::Receiver<BridgeEvent>> = None;
     // Keep tunnel handle alive so it doesn't get dropped
-    let mut _tunnel_handle: Option<tokio::process::Child> = None;
+    let mut _tunnel_handles: Vec<tokio::process::Child> = Vec::new();
 
     while app.running {
+        // Increment frame counter (used for spinner animation, etc.)
+        app.frame_count = app.frame_count.wrapping_add(1);
+
         // Process bridge events if engine is running
         if let Some(rx) = &mut event_rx {
-            while let Ok(event) = rx.try_recv() {
-                process_bridge_event(app, event);
+            while let Ok(evt) = rx.try_recv() {
+                process_bridge_event(app, evt);
+            }
+        }
+
+        // Auto-advance timer on Welcome page
+        if app.page == Page::Welcome && app.dep_check_complete && app.all_required_met() {
+            match &mut app.auto_advance_ticks {
+                Some(ticks) => {
+                    if *ticks == 0 {
+                        app.auto_advance_ticks = None;
+                        app.next_page();
+                    } else {
+                        *ticks -= 1;
+                    }
+                }
+                None => {
+                    // Start 2-second countdown (20 ticks at 100ms each)
+                    app.auto_advance_ticks = Some(20);
+                }
             }
         }
 
         terminal.draw(|frame| draw(frame, app))?;
 
         if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                let action = handle_input(app, key.code, key.modifiers).await;
-
-                match action {
-                    InputAction::None => {}
-                    InputAction::StartBridge => {
-                        // Initialize bridge engine when entering bridge page
-                        if bridge_engine.is_none() {
-                            let (tx, rx) = mpsc::channel(256);
-                            match BridgeEngine::new(app.settings.clone(), tx) {
-                                Ok(engine) => {
-                                    let engine = Arc::new(engine);
-
-                                    // Start autossh tunnel
-                                    match engine.start_tunnel().await {
-                                        Ok(child) => {
-                                            _tunnel_handle = child;
-                                        }
-                                        Err(e) => {
-                                            app.bridge_log.push(format!("Tunnel failed: {e} (continuing)"));
-                                        }
-                                    }
-
-                                    // Start background tasks
-                                    engine.start_health_monitor();
-                                    engine.start_receive_loop();
-                                    engine.start_heartbeat();
-
-                                    // Start Redis subscriber if needed
-                                    engine.start_redis_subscriber_if_active();
-
-                                    // Send handshake
-                                    {
-                                        let eng = engine.clone();
-                                        tokio::spawn(async move {
-                                            if let Err(e) = eng.send_handshake().await {
-                                                eprintln!("Handshake send failed: {e}");
-                                            }
-                                        });
-                                    }
-
-                                    bridge_engine = Some(engine);
-                                    event_rx = Some(rx);
-                                    app.connection_status = "Connecting...".to_string();
-                                    app.bridge_log.push("Bridge engine started".to_string());
-                                }
-                                Err(e) => {
-                                    app.bridge_log.push(format!("Engine init failed: {e}"));
-                                }
-                            }
-                        }
+            match event::read()? {
+                Event::Key(key) => {
+                    let action = handle_input(app, key.code, key.modifiers).await;
+                    let result = execute_action(app, action, &mut bridge_engine, &mut event_rx, &mut _tunnel_handles).await;
+                    // If activate returned a StartBridge, execute that too
+                    if let Some(follow_up) = result {
+                        let _ = execute_action(app, follow_up, &mut bridge_engine, &mut event_rx, &mut _tunnel_handles).await;
                     }
-                    InputAction::SwitchTransport(kind) => {
-                        if let Some(engine) = &bridge_engine {
-                            let engine = engine.clone();
-                            let kind = kind;
+                }
+                Event::Mouse(mouse) => {
+                    handle_mouse(app, mouse);
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Execute an InputAction, return an optional follow-up action
+async fn execute_action(
+    app: &mut App,
+    action: InputAction,
+    bridge_engine: &mut Option<Arc<BridgeEngine>>,
+    event_rx: &mut Option<mpsc::Receiver<BridgeEvent>>,
+    tunnel_handles: &mut Vec<tokio::process::Child>,
+) -> Option<InputAction> {
+    match action {
+        InputAction::None => None,
+        InputAction::StartBridge => {
+            if bridge_engine.is_none() {
+                let (tx, rx) = mpsc::channel(256);
+                match BridgeEngine::new(app.settings.clone(), tx) {
+                    Ok(engine) => {
+                        let engine = Arc::new(engine);
+
+                        let handles = engine.start_tunnels().await;
+                        *tunnel_handles = handles;
+
+                        engine.start_health_monitor();
+                        engine.start_receive_loop();
+                        engine.start_heartbeat();
+                        engine.start_redis_subscriber_if_active();
+
+                        {
+                            let eng = engine.clone();
                             tokio::spawn(async move {
-                                let _ = engine.switch_transport(kind).await;
-                            });
-                        }
-                    }
-                    InputAction::SendCommand(task) => {
-                        if let Some(engine) = &bridge_engine {
-                            let engine = engine.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = engine.send_command(task).await {
-                                    eprintln!("Send failed: {e}");
+                                if let Err(e) = eng.send_handshake().await {
+                                    // Can't eprintln during TUI — logged via engine event
+                                    let _ = e;
                                 }
                             });
                         }
+
+                        *bridge_engine = Some(engine);
+                        *event_rx = Some(rx);
+                        app.connection_status = "Connecting...".to_string();
+                        app.push_bridge_log("Bridge engine started".to_string());
                     }
-                    InputAction::LaunchSlave => {
-                        if let Some(engine) = &bridge_engine {
-                            let engine = engine.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = engine.launch_slave().await {
-                                    eprintln!("Slave launch failed: {e}");
-                                }
-                            });
+                    Err(e) => {
+                        app.push_bridge_log(format!("Engine init failed: {e}"));
+                    }
+                }
+            }
+            None
+        }
+        InputAction::SwitchTransport(kind) => {
+            if let Some(engine) = bridge_engine {
+                let engine = engine.clone();
+                tokio::spawn(async move {
+                    let _ = engine.switch_transport(kind).await;
+                });
+            }
+            None
+        }
+        InputAction::SendCommand(task) => {
+            if let Some(engine) = bridge_engine {
+                let engine = engine.clone();
+                tokio::spawn(async move {
+                    let _ = engine.send_command(task).await;
+                });
+            }
+            None
+        }
+        InputAction::LaunchSlave => {
+            if let Some(engine) = bridge_engine {
+                let engine = engine.clone();
+                tokio::spawn(async move {
+                    let _ = engine.launch_slave().await;
+                });
+            }
+            None
+        }
+        InputAction::PushInstall => {
+            app.push_setup_log("Pushing Interclaude to remote...".to_string());
+            let settings = app.settings.clone();
+            match connection::push_install_slave(&settings).await {
+                Ok(msg) => {
+                    app.push_setup_log(msg);
+                    app.push_setup_log("Push OK! Press Ctrl+D to go to Bridge, then Ctrl+L to start slave.".to_string());
+                }
+                Err(e) => {
+                    app.push_setup_log(format!("Push install failed: {e}"));
+                }
+            }
+            None
+        }
+        InputAction::Activate => {
+            // Full auto-sequence: Test → Save → Push Install → Deploy to Bridge
+            app.push_setup_log("=== Activating full sequence ===".to_string());
+
+            // Step 1: Test connection
+            app.ssh_test_running = true;
+            app.push_setup_log(format!(
+                "Testing {} connection to {}...",
+                app.settings.connection.label(),
+                app.settings.remote_host
+            ));
+            let result = connection::test_connection(&app.settings).await;
+            app.ssh_test_running = false;
+
+            if !result.success {
+                app.push_setup_log(format!("FAIL: {}", result.output));
+                app.push_setup_log("Activation aborted — connection test failed.".to_string());
+                return None;
+            }
+            app.ssh_test_passed = true;
+            app.connection_status = "Connected".to_string();
+            app.push_setup_log(format!("OK: {}", result.output));
+
+            // Step 2: Save config
+            match app.settings.save() {
+                Ok(()) => app.push_setup_log("Config saved.".to_string()),
+                Err(e) => {
+                    app.push_setup_log(format!("Save failed: {e}"));
+                    return None;
+                }
+            }
+
+            // Step 3: Push install
+            app.push_setup_log("Pushing binary to remote...".to_string());
+            let settings = app.settings.clone();
+            match connection::push_install_slave(&settings).await {
+                Ok(msg) => app.push_setup_log(msg),
+                Err(e) => {
+                    app.push_setup_log(format!("Push install failed: {e} (continuing)"));
+                }
+            }
+
+            // Step 4: Create dirs + go to Bridge
+            app.push_setup_log("Creating directories...".to_string());
+            match connection::setup_local_dirs(&app.settings) {
+                Ok(msg) => app.push_setup_log(msg),
+                Err(e) => app.push_setup_log(format!("Local dirs: {e}")),
+            }
+            match connection::setup_remote_dirs(&app.settings).await {
+                Ok(_) => app.push_setup_log("Remote dirs OK.".to_string()),
+                Err(e) => app.push_setup_log(format!("Remote dirs: {e} (continuing)")),
+            }
+
+            app.active_transport = app.settings.active_transport;
+            app.push_setup_log("=== Deploying Bridge ===".to_string());
+            app.next_page();
+            Some(InputAction::StartBridge)
+        }
+    }
+}
+
+fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
+    match mouse.kind {
+        MouseEventKind::ScrollUp => {
+            match app.page {
+                Page::Setup => {
+                    app.setup_log_scroll = app.setup_log_scroll.saturating_sub(1);
+                }
+                Page::Bridge => {
+                    app.bridge_log_scroll = app.bridge_log_scroll.saturating_sub(1);
+                }
+                _ => {}
+            }
+        }
+        MouseEventKind::ScrollDown => {
+            match app.page {
+                Page::Setup => {
+                    app.setup_log_scroll = app.setup_log_scroll.saturating_add(1);
+                }
+                Page::Bridge => {
+                    app.bridge_log_scroll = app.bridge_log_scroll.saturating_add(1);
+                }
+                _ => {}
+            }
+        }
+        MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+            let row = mouse.row;
+            let col = mouse.column;
+
+            // Tab bar clicks (top 3 rows, accounting for margin)
+            if row <= 3 {
+                if let Some(page) = status_bar::handle_tab_click(app, col) {
+                    app.page = page;
+                }
+                return;
+            }
+
+            // Page-specific click handling
+            match app.page {
+                Page::Welcome => {
+                    // Click anywhere on welcome → same as Enter
+                }
+                Page::Setup => {
+                    // Click on form fields (rows ~6-16 approximately, inside the config box)
+                    // The form starts after status bar (2) + margin (1) + title (3) + config border (1) + margin (1) = row ~8
+                    // Each field is 1 row tall
+                    let form_start_row = 8_u16;
+                    let form_fields = [
+                        SetupField::RemoteHost,
+                        SetupField::Connection,
+                        SetupField::SshUser,
+                        SetupField::SshPort,
+                        SetupField::KeyPath,
+                        SetupField::RemoteDir,
+                        SetupField::Transport,
+                        SetupField::RedisHost,
+                        SetupField::RedisPort,
+                        SetupField::RedisPassword,
+                    ];
+
+                    if row >= form_start_row && row < form_start_row + form_fields.len() as u16 {
+                        let idx = (row - form_start_row) as usize;
+                        if idx < form_fields.len() {
+                            app.setup_field = form_fields[idx];
+                        }
+                    }
+                }
+                Page::Bridge => {
+                    // Click on transport selector (row ~4-6, the header area)
+                    // Transport labels are in the header at row ~4
+                    if row >= 4 && row <= 6 {
+                        // Rough column ranges for transport labels
+                        // "[1]rsync" starts around col 14, "[2]MCP" around col 26, "[3]Redis" around col 36
+                        if col >= 10 && col < 24 {
+                            app.set_transport(TransportKind::Rsync);
+                        } else if col >= 24 && col < 34 {
+                            app.set_transport(TransportKind::Mcp);
+                        } else if col >= 34 && col < 46 {
+                            app.set_transport(TransportKind::Redis);
+                        }
+                    }
+
+                    // Click on messages in outbox/inbox (row >= 7)
+                    // Messages start after header, each is 1 row
+                    // This is approximate — exact positioning depends on layout
+                    if row >= 7 && !app.messages.is_empty() {
+                        let msg_row = (row - 7) as usize;
+                        if msg_row < app.messages.len() {
+                            app.selected_message = Some(msg_row);
                         }
                     }
                 }
             }
         }
+        _ => {}
     }
-    Ok(())
 }
 
 /// Actions that input handling can request
@@ -157,6 +355,8 @@ enum InputAction {
     SwitchTransport(TransportKind),
     SendCommand(String),
     LaunchSlave,
+    PushInstall,
+    Activate,
 }
 
 fn process_bridge_event(app: &mut App, event: BridgeEvent) {
@@ -167,10 +367,7 @@ fn process_bridge_event(app: &mut App, event: BridgeEvent) {
         BridgeEvent::MessageReceived(entry) => {
             app.messages.push(entry);
         }
-        BridgeEvent::CommandReceived(_msg) => {
-            // In TUI mode (master), we don't execute commands locally
-            // This is handled by the slave's event loop in main.rs
-        }
+        BridgeEvent::CommandReceived(_msg) => {}
         BridgeEvent::HealthUpdate(kind, healthy) => {
             let idx = match kind {
                 TransportKind::Rsync => 0,
@@ -180,10 +377,16 @@ fn process_bridge_event(app: &mut App, event: BridgeEvent) {
             app.transport_health[idx] = healthy;
         }
         BridgeEvent::ConnectionStatus(status) => {
-            app.connection_status = status;
+            if status.starts_with("Connected") {
+                app.connection_status = status;
+            } else {
+                app.connection_status = status;
+                if app.session_status.starts_with("Active") {
+                    app.session_status = "Inactive".to_string();
+                }
+            }
         }
         BridgeEvent::StatusUpdate(msg_id, status) => {
-            // Update the status of an existing message
             for msg in &mut app.messages {
                 if msg.msg_id == msg_id {
                     msg.status = status;
@@ -191,18 +394,15 @@ fn process_bridge_event(app: &mut App, event: BridgeEvent) {
             }
         }
         BridgeEvent::Log(msg) => {
-            app.bridge_log.push(msg);
-            // Keep log at reasonable size
-            if app.bridge_log.len() > 100 {
-                app.bridge_log.drain(0..50);
-            }
+            app.push_bridge_log(msg);
         }
         BridgeEvent::TransportSwitched(kind) => {
             app.active_transport = kind;
         }
         BridgeEvent::RoleConfirmed(role) => {
-            app.bridge_log.push(format!("Role confirmed: {:?}", role));
+            app.push_bridge_log(format!("Role confirmed: {:?}", role));
             app.connection_status = format!("Connected ({:?})", role);
+            app.session_status = format!("Active ({:?})", role);
         }
     }
 }
@@ -216,12 +416,41 @@ fn draw(frame: &mut Frame, app: &App) {
 }
 
 async fn handle_input(app: &mut App, key: KeyCode, modifiers: KeyModifiers) -> InputAction {
-    // If composing a command, handle compose input
-    if app.composing {
-        return handle_compose_input(app, key, modifiers);
+    // On Bridge page, typing goes directly to the input bar
+    if app.page == Page::Bridge && !modifiers.contains(KeyModifiers::CONTROL) {
+        match key {
+            KeyCode::Enter => {
+                if !app.compose_input.is_empty() {
+                    let task = app.compose_input.clone();
+                    app.compose_input.clear();
+                    return InputAction::SendCommand(task);
+                }
+                return InputAction::None;
+            }
+            KeyCode::Char(c) => {
+                // Only capture if not a transport switch key or if input has content
+                if !app.compose_input.is_empty() || !matches!(c, '1' | '2' | '3') {
+                    app.compose_input.push(c);
+                    return InputAction::None;
+                }
+                // Fall through for 1/2/3 transport switch when input is empty
+            }
+            KeyCode::Backspace => {
+                app.compose_input.pop();
+                return InputAction::None;
+            }
+            KeyCode::Esc => {
+                if !app.compose_input.is_empty() {
+                    app.compose_input.clear();
+                    return InputAction::None;
+                }
+                // Fall through to page navigation
+            }
+            _ => {} // Fall through for Up/Down/etc
+        }
     }
 
-    // Global keybindings
+    // Global Ctrl keybindings
     if modifiers.contains(KeyModifiers::CONTROL) {
         match key {
             KeyCode::Char('q') => {
@@ -229,9 +458,11 @@ async fn handle_input(app: &mut App, key: KeyCode, modifiers: KeyModifiers) -> I
                 return InputAction::None;
             }
             KeyCode::Char('s') => {
-                match app.settings.save() {
-                    Ok(()) => app.setup_log.push("Config saved.".to_string()),
-                    Err(e) => app.setup_log.push(format!("Save failed: {e}")),
+                if app.page == Page::Setup {
+                    match app.settings.save() {
+                        Ok(()) => app.push_setup_log("Config saved.".to_string()),
+                        Err(e) => app.push_setup_log(format!("Save failed: {e}")),
+                    }
                 }
                 return InputAction::None;
             }
@@ -259,35 +490,6 @@ async fn handle_input(app: &mut App, key: KeyCode, modifiers: KeyModifiers) -> I
     }
 }
 
-fn handle_compose_input(app: &mut App, key: KeyCode, modifiers: KeyModifiers) -> InputAction {
-    match key {
-        KeyCode::Esc => {
-            app.composing = false;
-            app.compose_input.clear();
-            InputAction::None
-        }
-        KeyCode::Enter => {
-            if !app.compose_input.is_empty() {
-                let task = app.compose_input.clone();
-                app.compose_input.clear();
-                app.composing = false;
-                InputAction::SendCommand(task)
-            } else {
-                InputAction::None
-            }
-        }
-        KeyCode::Char(c) => {
-            app.compose_input.push(c);
-            InputAction::None
-        }
-        KeyCode::Backspace => {
-            app.compose_input.pop();
-            InputAction::None
-        }
-        _ => InputAction::None,
-    }
-}
-
 async fn handle_welcome_input(app: &mut App, key: KeyCode) {
     match key {
         KeyCode::Enter => app.next_page(),
@@ -299,10 +501,113 @@ async fn handle_welcome_input(app: &mut App, key: KeyCode) {
 }
 
 async fn handle_setup_input(app: &mut App, key: KeyCode, modifiers: KeyModifiers) -> InputAction {
+    // Handle Ctrl combinations first (before Enter/char matching)
+    if modifiers.contains(KeyModifiers::CONTROL) {
+        match key {
+            KeyCode::Char('d') => {
+                // Ctrl+D = save, setup dirs, proceed to bridge (works from ANY field)
+                app.push_setup_log("Saving configuration...".to_string());
+                match app.settings.save() {
+                    Ok(()) => app.push_setup_log("Config saved.".to_string()),
+                    Err(e) => {
+                        app.push_setup_log(format!("Save failed: {e}"));
+                        return InputAction::None;
+                    }
+                }
+
+                app.push_setup_log("Creating local directories...".to_string());
+                match connection::setup_local_dirs(&app.settings) {
+                    Ok(msg) => app.push_setup_log(msg),
+                    Err(e) => {
+                        app.push_setup_log(format!("Local setup failed: {e}"));
+                        return InputAction::None;
+                    }
+                }
+
+                app.push_setup_log("Creating remote directories...".to_string());
+                match connection::setup_remote_dirs(&app.settings).await {
+                    Ok(_msg) => {
+                        app.push_setup_log("Remote dirs OK.".to_string());
+                    }
+                    Err(e) => {
+                        app.push_setup_log(format!("Remote setup failed: {e}"));
+                        app.push_setup_log("Proceeding anyway (set up remote manually).".to_string());
+                    }
+                }
+
+                app.active_transport = app.settings.active_transport;
+                app.next_page();
+                return InputAction::StartBridge;
+            }
+            KeyCode::Char('t') => {
+                // Ctrl+T = Test connection
+                app.ssh_test_running = true;
+                app.push_setup_log(format!(
+                    "Testing {} connection to {}...",
+                    app.settings.connection.label(),
+                    app.settings.remote_host
+                ));
+
+                let result = connection::test_connection(&app.settings).await;
+                app.ssh_test_running = false;
+
+                if result.success {
+                    app.ssh_test_passed = true;
+                    app.connection_status = "Connected".to_string();
+                    app.push_setup_log(format!("OK: {}", result.output));
+                } else {
+                    app.push_setup_log(format!("FAIL: {}", result.output));
+                }
+                return InputAction::None;
+            }
+            KeyCode::Char('g') => {
+                // Ctrl+G = Generate SSH key
+                app.push_setup_log("Generating SSH key...".to_string());
+                let key_path = crate::config::Settings::expand_path(&app.settings.key_path);
+                if std::path::Path::new(&key_path).exists() {
+                    app.push_setup_log(format!("Key already exists at {key_path}"));
+                } else {
+                    match tokio::process::Command::new("ssh-keygen")
+                        .args(["-t", "ed25519", "-f", &key_path, "-N", "", "-C", "interclaude"])
+                        .output()
+                        .await
+                    {
+                        Ok(output) => {
+                            if output.status.success() {
+                                app.push_setup_log(format!("Key generated at {key_path}"));
+                                app.push_setup_log("Copy public key to remote: ssh-copy-id".to_string());
+                            } else {
+                                let err = String::from_utf8_lossy(&output.stderr);
+                                app.push_setup_log(format!("Key gen failed: {err}"));
+                            }
+                        }
+                        Err(e) => app.push_setup_log(format!("ssh-keygen error: {e}")),
+                    }
+                }
+                return InputAction::None;
+            }
+            KeyCode::Char('p') => {
+                // Ctrl+P = Push install to remote
+                return InputAction::PushInstall;
+            }
+            KeyCode::Char('a') => {
+                // Ctrl+A = Activate (full auto-sequence)
+                if app.has_remote_config() {
+                    return InputAction::Activate;
+                } else {
+                    app.push_setup_log("Fill Remote Host and User first.".to_string());
+                    return InputAction::None;
+                }
+            }
+            _ => {}
+        }
+    }
+
     match key {
-        KeyCode::Tab => app.setup_field = app.setup_field.next(),
-        KeyCode::BackTab => app.setup_field = app.setup_field.prev(),
+        KeyCode::Tab | KeyCode::Down => app.setup_field = app.setup_field.next(),
+        KeyCode::BackTab | KeyCode::Up => app.setup_field = app.setup_field.prev(),
         KeyCode::Enter => {
+            // Plain Enter — cycle selector fields
             if app.setup_field == SetupField::Connection {
                 app.settings.connection = app.settings.connection.cycle();
             } else if app.setup_field == SetupField::Transport {
@@ -311,42 +616,6 @@ async fn handle_setup_input(app: &mut App, key: KeyCode, modifiers: KeyModifiers
                     TransportKind::Mcp => TransportKind::Redis,
                     TransportKind::Redis => TransportKind::Rsync,
                 };
-            } else if modifiers.contains(KeyModifiers::CONTROL) {
-                // Ctrl+Enter = save config, setup dirs, proceed to bridge
-                app.setup_log.push("Saving configuration...".to_string());
-                match app.settings.save() {
-                    Ok(()) => app.setup_log.push("Config saved.".to_string()),
-                    Err(e) => {
-                        app.setup_log.push(format!("Save failed: {e}"));
-                        return InputAction::None;
-                    }
-                }
-
-                app.setup_log.push("Creating local directories...".to_string());
-                match connection::setup_local_dirs(&app.settings) {
-                    Ok(msg) => app.setup_log.push(msg),
-                    Err(e) => {
-                        app.setup_log.push(format!("Local setup failed: {e}"));
-                        return InputAction::None;
-                    }
-                }
-
-                app.setup_log.push("Creating remote directories...".to_string());
-                match connection::setup_remote_dirs(&app.settings).await {
-                    Ok(_msg) => {
-                        app.setup_log.push("Remote dirs OK.".to_string());
-                    }
-                    Err(e) => {
-                        app.setup_log
-                            .push(format!("Remote setup failed: {e}"));
-                        app.setup_log
-                            .push("Proceeding anyway (set up remote manually).".to_string());
-                    }
-                }
-
-                app.active_transport = app.settings.active_transport;
-                app.next_page();
-                return InputAction::StartBridge;
             }
         }
         KeyCode::Char(c) => {
@@ -369,53 +638,6 @@ async fn handle_setup_input(app: &mut App, key: KeyCode, modifiers: KeyModifiers
                 app.settings.set_field(&app.setup_field, &val);
             }
         }
-        KeyCode::F(2) => {
-            app.ssh_test_running = true;
-            app.setup_log.push(format!(
-                "Testing {} connection to {}...",
-                app.settings.connection.label(),
-                app.settings.remote_host
-            ));
-
-            let result = connection::test_connection(&app.settings).await;
-            app.ssh_test_running = false;
-
-            if result.success {
-                app.setup_log.push(format!("OK: {}", result.output));
-            } else {
-                app.setup_log.push(format!("FAIL: {}", result.output));
-            }
-        }
-        KeyCode::F(3) => {
-            app.setup_log.push("Generating SSH key...".to_string());
-            let key_path = crate::config::Settings::expand_path(&app.settings.key_path);
-            if std::path::Path::new(&key_path).exists() {
-                app.setup_log
-                    .push(format!("Key already exists at {key_path}"));
-            } else {
-                match tokio::process::Command::new("ssh-keygen")
-                    .args([
-                        "-t", "ed25519", "-f", &key_path, "-N", "", "-C", "interclaude",
-                    ])
-                    .output()
-                    .await
-                {
-                    Ok(output) => {
-                        if output.status.success() {
-                            app.setup_log
-                                .push(format!("Key generated at {key_path}"));
-                            app.setup_log.push(
-                                "Copy public key to remote: ssh-copy-id".to_string(),
-                            );
-                        } else {
-                            let err = String::from_utf8_lossy(&output.stderr);
-                            app.setup_log.push(format!("Key gen failed: {err}"));
-                        }
-                    }
-                    Err(e) => app.setup_log.push(format!("ssh-keygen error: {e}")),
-                }
-            }
-        }
         _ => {}
     }
 
@@ -423,16 +645,13 @@ async fn handle_setup_input(app: &mut App, key: KeyCode, modifiers: KeyModifiers
 }
 
 fn handle_bridge_input(app: &mut App, key: KeyCode, modifiers: KeyModifiers) -> InputAction {
-    // Ctrl+N = compose new command
-    if modifiers.contains(KeyModifiers::CONTROL) && key == KeyCode::Char('n') {
-        app.composing = true;
-        app.compose_input.clear();
-        return InputAction::None;
-    }
-
-    // Ctrl+L = launch slave watcher on remote
-    if modifiers.contains(KeyModifiers::CONTROL) && key == KeyCode::Char('l') {
-        return InputAction::LaunchSlave;
+    if modifiers.contains(KeyModifiers::CONTROL) {
+        match key {
+            KeyCode::Char('l') => {
+                return InputAction::LaunchSlave;
+            }
+            _ => {}
+        }
     }
 
     match key {
@@ -471,18 +690,21 @@ fn handle_bridge_input(app: &mut App, key: KeyCode, modifiers: KeyModifiers) -> 
 }
 
 async fn check_dependencies(app: &mut App) {
-    let deps = vec![
-        ("ssh", "ssh -V"),
-        ("mosh", "mosh --version"),
-        ("autossh", "autossh -V"),
-        ("rsync", "rsync --version"),
-        ("fswatch", "fswatch --version"),
-        ("redis-cli", "redis-cli --version"),
-        ("claude", "claude --version"),
+    // (name, check_cmd, install_hint, required)
+    let deps: Vec<(&str, &str, &str, bool)> = vec![
+        ("ssh",       "ssh -V",              "(built-in)",                        true),
+        ("rsync",     "rsync --version",     "brew install rsync",                true),
+        ("claude",    "claude --version",    "npm i -g @anthropic-ai/claude-code", true),
+        ("mosh",      "mosh --version",      "brew install mosh",                 false),
+        ("autossh",   "autossh -V",          "brew install autossh",              false),
+        ("fswatch",   "fswatch --version",   "brew install fswatch",              false),
+        ("redis-cli", "redis-cli --version", "brew install redis",                false),
     ];
 
     app.dep_checks.clear();
-    for (name, cmd) in deps {
+    app.dep_check_complete = false;
+
+    for (name, cmd, hint, required) in deps {
         let parts: Vec<&str> = cmd.split_whitespace().collect();
         let result = tokio::process::Command::new(parts[0])
             .args(&parts[1..])
@@ -493,17 +715,27 @@ async fn check_dependencies(app: &mut App) {
             Ok(output) => {
                 let ver = String::from_utf8_lossy(&output.stdout)
                     .lines()
-                    .next()
+                    .find(|l| !l.trim().is_empty()
+                        && !l.starts_with("Usage:")
+                        && !l.starts_with("Warning:"))
                     .unwrap_or("")
                     .trim()
                     .to_string();
                 let ver = if ver.is_empty() {
                     String::from_utf8_lossy(&output.stderr)
                         .lines()
-                        .next()
+                        .find(|l| !l.trim().is_empty()
+                            && !l.starts_with("Usage:")
+                            && !l.starts_with("Warning:"))
                         .unwrap_or("")
                         .trim()
                         .to_string()
+                } else {
+                    ver
+                };
+                // Truncate noisy version strings
+                let ver = if ver.len() > 40 {
+                    format!("{}...", &ver[..37])
                 } else {
                     ver
                 };
@@ -516,6 +748,10 @@ async fn check_dependencies(app: &mut App) {
             name: name.to_string(),
             available,
             version,
+            install_hint: hint.to_string(),
+            required,
         });
     }
+
+    app.dep_check_complete = true;
 }
