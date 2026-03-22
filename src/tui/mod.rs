@@ -293,27 +293,46 @@ fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                     // Click anywhere on welcome → same as Enter
                 }
                 Page::Setup => {
-                    // Click on form fields (rows ~6-16 approximately, inside the config box)
-                    // The form starts after status bar (2) + margin (1) + title (3) + config border (1) + margin (1) = row ~8
-                    // Each field is 1 row tall
-                    let form_start_row = 8_u16;
-                    let form_fields = [
-                        SetupField::RemoteHost,
-                        SetupField::Connection,
-                        SetupField::SshUser,
-                        SetupField::SshPort,
-                        SetupField::KeyPath,
-                        SetupField::RemoteDir,
-                        SetupField::Transport,
-                        SetupField::RedisHost,
-                        SetupField::RedisPort,
-                        SetupField::RedisPassword,
-                    ];
+                    // Form with section headers — layout:
+                    // row+0: "── Connection ──" header
+                    // row+1..6: 6 connection fields
+                    // row+7: spacer
+                    // row+8: "── Transport ──" header
+                    // row+9: Transport field
+                    // row+10: spacer (if redis)
+                    // row+11: "── Redis ──" header (if redis)
+                    // row+12..14: Redis fields (if redis)
+                    let form_start_row = 8_u16; // after status bar + margin + title + border
+                    let mut field_rows: Vec<(u16, SetupField)> = Vec::new();
+                    let mut r = form_start_row;
+                    r += 1; // Connection header
+                    for field in [
+                        SetupField::RemoteHost, SetupField::Connection,
+                        SetupField::SshUser, SetupField::SshPort,
+                        SetupField::KeyPath, SetupField::RemoteDir,
+                    ] {
+                        field_rows.push((r, field));
+                        r += 1;
+                    }
+                    r += 1; // spacer
+                    r += 1; // Transport header
+                    field_rows.push((r, SetupField::Transport));
+                    r += 1;
+                    if app.show_redis_config() {
+                        r += 1; // spacer
+                        r += 1; // Redis header
+                        for field in [
+                            SetupField::RedisHost, SetupField::RedisPort, SetupField::RedisPassword,
+                        ] {
+                            field_rows.push((r, field));
+                            r += 1;
+                        }
+                    }
 
-                    if row >= form_start_row && row < form_start_row + form_fields.len() as u16 {
-                        let idx = (row - form_start_row) as usize;
-                        if idx < form_fields.len() {
-                            app.setup_field = form_fields[idx];
+                    for (field_row, field) in &field_rows {
+                        if row == *field_row {
+                            app.setup_field = *field;
+                            break;
                         }
                     }
                 }
@@ -604,8 +623,14 @@ async fn handle_setup_input(app: &mut App, key: KeyCode, modifiers: KeyModifiers
     }
 
     match key {
-        KeyCode::Tab | KeyCode::Down => app.setup_field = app.setup_field.next(),
-        KeyCode::BackTab | KeyCode::Up => app.setup_field = app.setup_field.prev(),
+        KeyCode::Tab | KeyCode::Down => {
+            let show_redis = app.show_redis_config();
+            app.setup_field = app.setup_field.next_visible(show_redis);
+        }
+        KeyCode::BackTab | KeyCode::Up => {
+            let show_redis = app.show_redis_config();
+            app.setup_field = app.setup_field.prev_visible(show_redis);
+        }
         KeyCode::Enter => {
             // Plain Enter — cycle selector fields
             if app.setup_field == SetupField::Connection {
@@ -616,6 +641,10 @@ async fn handle_setup_input(app: &mut App, key: KeyCode, modifiers: KeyModifiers
                     TransportKind::Mcp => TransportKind::Redis,
                     TransportKind::Redis => TransportKind::Rsync,
                 };
+                // Snap focus away from Redis fields if they're now hidden
+                if app.setup_field.is_redis_field() && !app.show_redis_config() {
+                    app.setup_field = SetupField::Transport;
+                }
             }
         }
         KeyCode::Char(c) => {

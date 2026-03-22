@@ -130,9 +130,34 @@ impl SetupField {
         }
     }
 
+    /// Transport-aware next: skips Redis fields when Redis not selected
+    pub fn next_visible(&self, show_redis: bool) -> Self {
+        let next = self.next();
+        if !show_redis && next.is_redis_field() {
+            Self::RemoteHost
+        } else {
+            next
+        }
+    }
+
+    /// Transport-aware prev: skips Redis fields when Redis not selected
+    pub fn prev_visible(&self, show_redis: bool) -> Self {
+        let prev = self.prev();
+        if !show_redis && prev.is_redis_field() {
+            Self::Transport
+        } else {
+            prev
+        }
+    }
+
     /// Whether this field cycles through options on Enter rather than accepting text input
     pub fn is_selector(&self) -> bool {
         matches!(self, Self::Connection | Self::Transport)
+    }
+
+    /// Whether this field belongs to the Redis configuration group
+    pub fn is_redis_field(&self) -> bool {
+        matches!(self, Self::RedisHost | Self::RedisPort | Self::RedisPassword)
     }
 }
 
@@ -284,6 +309,11 @@ impl App {
             self.bridge_log.drain(0..50);
         }
         self.bridge_log_scroll = u16::MAX;
+    }
+
+    /// Whether Redis configuration should be shown (transport is Redis)
+    pub fn show_redis_config(&self) -> bool {
+        self.settings.active_transport == TransportKind::Redis
     }
 
     /// Whether all required dependencies are available
