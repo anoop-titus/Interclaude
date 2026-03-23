@@ -19,23 +19,30 @@ pub async fn rsync_once(settings: &Settings, direction: SyncDirection) -> Result
     let remote_dir = &settings.remote_dir;
 
     // Build SSH command for rsync to use
-    let mut ssh_cmd = format!("ssh -p {} -o StrictHostKeyChecking=accept-new", settings.ssh_port);
+    let mut ssh_cmd = format!("ssh -F /dev/null -p {} -o StrictHostKeyChecking=accept-new", settings.ssh_port);
     if !key.is_empty() && std::path::Path::new(&key).exists() {
         ssh_cmd.push_str(&format!(" -i {key}"));
     }
 
+    // Determine cross-role paths:
+    // Master sends to Slave/Inbox on remote, receives from Slave/Outbox on remote
+    // Slave sends to Master/Inbox on remote, receives from Master/Outbox on remote
+    let (our_role, their_role) = match settings.role {
+        crate::config::Role::Master => ("Master", "Slave"),
+        crate::config::Role::Slave => ("Slave", "Master"),
+    };
+
     let (src, dst) = match direction {
         SyncDirection::Push => {
-            // Master outbox -> remote Master inbox (for slave to read)
-            // Also sync .status/ and .ledger
-            let local_outbox = local_dir.join("Master/Outbox/");
-            let remote_inbox = format!("{dest}:{remote_dir}/Master/Outbox/");
+            // Our outbox -> remote's OTHER role inbox (cross-connect)
+            let local_outbox = local_dir.join(format!("{our_role}/Outbox/"));
+            let remote_inbox = format!("{dest}:{remote_dir}/{their_role}/Inbox/");
             (local_outbox.to_string_lossy().to_string(), remote_inbox)
         }
         SyncDirection::Pull => {
-            // Remote Slave outbox -> local Slave inbox (for master to read)
-            let remote_outbox = format!("{dest}:{remote_dir}/Slave/Outbox/");
-            let local_inbox = local_dir.join("Slave/Outbox/");
+            // Remote's OTHER role outbox -> our inbox (cross-connect)
+            let remote_outbox = format!("{dest}:{remote_dir}/{their_role}/Outbox/");
+            let local_inbox = local_dir.join(format!("{our_role}/Inbox/"));
             (remote_outbox, local_inbox.to_string_lossy().to_string())
         }
     };
@@ -145,6 +152,8 @@ pub async fn sync_ledger(settings: &Settings) -> Result<()> {
     let mut child = Command::new("ssh")
         .args(&ssh_args2)
         .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .spawn()
         .context("Failed to write remote ledger")?;
 
@@ -166,7 +175,7 @@ pub async fn sync_status(settings: &Settings) -> Result<()> {
     let local_dir = settings.local_interclaude_dir();
     let remote_dir = &settings.remote_dir;
 
-    let mut ssh_cmd = format!("ssh -p {} -o StrictHostKeyChecking=accept-new", settings.ssh_port);
+    let mut ssh_cmd = format!("ssh -F /dev/null -p {} -o StrictHostKeyChecking=accept-new", settings.ssh_port);
     if !key.is_empty() && std::path::Path::new(&key).exists() {
         ssh_cmd.push_str(&format!(" -i {key}"));
     }

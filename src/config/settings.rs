@@ -79,7 +79,7 @@ impl Default for Settings {
                 password: String::new(),
             },
             mcp_port: 9876,
-            message_timeout_secs: 300,
+            message_timeout_secs: 120,
             credentials: CredentialConfig::default(),
         }
     }

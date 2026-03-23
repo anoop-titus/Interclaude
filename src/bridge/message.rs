@@ -12,6 +12,8 @@ pub enum MessageType {
     Error,
     Heartbeat,
     TransportSwitch,
+    Ping,
+    Pong,
 }
 
 /// A message in the Interclaude protocol
@@ -34,7 +36,14 @@ pub enum MessagePayload {
     Response(ResponsePayload),
     Status(StatusPayload),
     TransportSwitch(TransportSwitchPayload),
+    Ping(PingPayload),
     Empty {},
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PingPayload {
+    pub origin_timestamp_ms: i64,
+    pub origin_msg_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,6 +104,37 @@ impl Message {
         }
     }
 
+    pub fn new_ping(sequence: u64, role: &str, transport: &str) -> Self {
+        let msg_id = Uuid::now_v7().to_string();
+        Self {
+            msg_id: msg_id.clone(),
+            msg_type: MessageType::Ping,
+            timestamp: Utc::now(),
+            sequence,
+            sender_role: role.to_string(),
+            transport_used: transport.to_string(),
+            payload: MessagePayload::Ping(PingPayload {
+                origin_timestamp_ms: Utc::now().timestamp_millis(),
+                origin_msg_id: msg_id,
+            }),
+        }
+    }
+
+    pub fn new_pong(sequence: u64, role: &str, transport: &str, ping: &PingPayload) -> Self {
+        Self {
+            msg_id: Uuid::now_v7().to_string(),
+            msg_type: MessageType::Pong,
+            timestamp: Utc::now(),
+            sequence,
+            sender_role: role.to_string(),
+            transport_used: transport.to_string(),
+            payload: MessagePayload::Ping(PingPayload {
+                origin_timestamp_ms: ping.origin_timestamp_ms,
+                origin_msg_id: ping.origin_msg_id.clone(),
+            }),
+        }
+    }
+
     /// Generate filename for this message
     pub fn filename(&self) -> String {
         let ts = self.timestamp.format("%Y%m%d_%H%M%S");
@@ -105,6 +145,8 @@ impl Message {
             MessageType::Error => "error",
             MessageType::Heartbeat => "heartbeat",
             MessageType::TransportSwitch => "transport_switch",
+            MessageType::Ping => "ping",
+            MessageType::Pong => "pong",
         };
         format!("{}_{:04}_{}.json", ts, self.sequence, msg_type)
     }
@@ -132,6 +174,7 @@ impl Message {
             MessagePayload::TransportSwitch(sw) => {
                 format!("Switch: {} -> {}", sw.from, sw.to)
             }
+            MessagePayload::Ping(p) => format!("ping (origin: {})", &p.origin_msg_id[..8.min(p.origin_msg_id.len())]),
             MessagePayload::Empty {} => "heartbeat".to_string(),
         }
     }

@@ -26,7 +26,7 @@ fn draw_layout(frame: &mut Frame, app: &App, area: Rect) {
     let show_status = if small_terminal { false } else { app.show_status_panel };
     let _show_pipeline = if small_terminal { false } else { app.show_pipeline_panel };
 
-    let status_height = if show_status { 5 } else { 0 };
+    let status_height = if show_status { 7 } else { 0 };
 
     let main_chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -228,8 +228,13 @@ fn draw_messages(frame: &mut Frame, app: &App, area: Rect) {
         .highlight_style(Style::default().bg(Color::DarkGray));
 
     let mut outbox_state = ListState::default();
-    if outbox_focused && !outbox_msgs.is_empty() {
-        outbox_state.select(Some(app.outbox_scroll.min(outbox_msgs.len().saturating_sub(1))));
+    if !outbox_msgs.is_empty() {
+        let idx = if app.outbox_autoscroll {
+            outbox_msgs.len().saturating_sub(1)
+        } else {
+            app.outbox_scroll.min(outbox_msgs.len().saturating_sub(1))
+        };
+        outbox_state.select(Some(idx));
     }
     frame.render_stateful_widget(outbox_list, outbox_area, &mut outbox_state);
 
@@ -298,8 +303,13 @@ fn draw_messages(frame: &mut Frame, app: &App, area: Rect) {
         .highlight_style(Style::default().bg(Color::DarkGray));
 
     let mut inbox_state = ListState::default();
-    if inbox_focused && !inbox_msgs.is_empty() {
-        inbox_state.select(Some(app.inbox_scroll.min(inbox_msgs.len().saturating_sub(1))));
+    if !inbox_msgs.is_empty() {
+        let idx = if app.inbox_autoscroll {
+            inbox_msgs.len().saturating_sub(1)
+        } else {
+            app.inbox_scroll.min(inbox_msgs.len().saturating_sub(1))
+        };
+        inbox_state.select(Some(idx));
     }
     frame.render_stateful_widget(inbox_list, inbox_area, &mut inbox_state);
 }
@@ -341,6 +351,27 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         active_text,
         Style::default().fg(Color::Cyan).bold(),
     )));
+
+    // Session + Ping latency line
+    let ping_span = match app.last_ping_ms {
+        Some(ms) if ms < 100 => Span::styled(format!("{}ms", ms), Style::default().fg(Color::Green)),
+        Some(ms) if ms < 500 => Span::styled(format!("{}ms", ms), Style::default().fg(Color::Yellow)),
+        Some(ms) => Span::styled(format!("{}ms", ms), Style::default().fg(Color::Red)),
+        None => Span::styled("--", Style::default().fg(Color::DarkGray)),
+    };
+    health_lines.push(Line::from(vec![
+        Span::styled(" Session: ", Style::default().fg(Color::White)),
+        Span::styled(
+            &app.session_status,
+            if app.session_status.starts_with("Active") {
+                Style::default().fg(Color::Green)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            },
+        ),
+        Span::styled(" | Ping: ", Style::default().fg(Color::White)),
+        ping_span,
+    ]));
 
     if let Some(last_log) = app.bridge_log.last() {
         let log_text = truncate_str(last_log, health_inner.saturating_sub(1));
@@ -626,6 +657,7 @@ fn status_color(status: &DeliveryStatus) -> Style {
         DeliveryStatus::Read => Style::default().fg(Color::Blue),
         DeliveryStatus::Executing => Style::default().fg(Color::Magenta),
         DeliveryStatus::Executed => Style::default().fg(Color::Cyan),
+        DeliveryStatus::Streaming => Style::default().fg(Color::Cyan).add_modifier(ratatui::style::Modifier::BOLD),
         DeliveryStatus::Replying => Style::default().fg(Color::Blue),
         DeliveryStatus::ReceivingReply => Style::default().fg(Color::Yellow),
         DeliveryStatus::ReceivedReply => Style::default().fg(Color::Green),
@@ -641,6 +673,7 @@ fn render_delivery_pipeline(current: &DeliveryStatus, frame_count: u64) -> Vec<L
         (DeliveryStatus::Read, "READ"),
         (DeliveryStatus::Executing, "RUNNING"),
         (DeliveryStatus::Executed, "DONE"),
+        (DeliveryStatus::Streaming, "STREAMING"),
         (DeliveryStatus::Replying, "REPLYING"),
         (DeliveryStatus::ReceivingReply, "RECEIVING"),
         (DeliveryStatus::ReceivedReply, "COMPLETE"),

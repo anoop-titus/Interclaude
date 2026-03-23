@@ -43,13 +43,20 @@ impl RedisTransport {
         }
     }
 
+    /// Deterministic channel key based on remote host (both sides use same key)
+    fn channel_key(&self) -> String {
+        // Use remote_host as the shared identifier — both master and slave
+        // connect to the same remote, so they share this key
+        format!("interclaude:{}", self.settings.remote_host)
+    }
+
     /// Channel name for this session's messages directed at us
     fn subscribe_channel(&self) -> String {
         let role = match self.settings.role {
             crate::config::Role::Master => "master",
             crate::config::Role::Slave => "slave",
         };
-        format!("interclaude:{}:{}", self.session_id, role)
+        format!("{}:{}", self.channel_key(), role)
     }
 
     /// Channel name for sending messages to the other side
@@ -58,7 +65,7 @@ impl RedisTransport {
             crate::config::Role::Master => "slave",
             crate::config::Role::Slave => "master",
         };
-        format!("interclaude:{}:{}", self.session_id, target_role)
+        format!("{}:{}", self.channel_key(), target_role)
     }
 
     /// Build Redis connection URL
@@ -95,7 +102,7 @@ impl RedisTransport {
                 match subscribe_loop(&url, &channel, &received, &inbox_dir).await {
                     Ok(()) => break, // clean exit
                     Err(e) => {
-                        eprintln!("Redis subscriber error: {e}, reconnecting in 2s...");
+                        crate::logging::log(&format!("Redis subscriber error: {e}, reconnecting in 2s..."));
                         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                     }
                 }
@@ -136,7 +143,7 @@ async fn subscribe_loop(
         let payload: String = match msg.get_payload() {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("Redis message payload error: {e}");
+                crate::logging::log(&format!("Redis message payload error: {e}"));
                 continue;
             }
         };
@@ -153,7 +160,7 @@ async fn subscribe_loop(
                 received.lock().await.push(message);
             }
             Err(e) => {
-                eprintln!("Failed to parse Redis message: {e}");
+                crate::logging::log(&format!("Failed to parse Redis message: {e}"));
             }
         }
     }

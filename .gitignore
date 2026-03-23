@@ -1,2 +1,12 @@
 /target
 .claude/
+.cache/
+.planning/
+.tldr/
+.tldrignore
+assets/
+*.pem
+*.key
+.env
+.env.*
+.DS_Store

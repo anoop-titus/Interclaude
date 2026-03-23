@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
+use chrono::Utc;
 use crate::app::{AccessPortalField, App, BridgeFocus, MessageDirection, Page, SetupField};
 use crate::bridge::connection;
 use crate::bridge::engine::{BridgeEngine, BridgeEvent};
@@ -177,6 +178,14 @@ async fn run_loop(
             }
         }
     }
+
+    // Session cleanup: wipe Inbox/Outbox contents on exit
+    if bridge_engine.is_some() {
+        crate::logging::log("Cleaning up session files...");
+        connection::cleanup_local_contents(&app.settings);
+        connection::cleanup_remote_contents(&app.settings).await;
+    }
+
     Ok(())
 }
 
@@ -197,27 +206,47 @@ async fn execute_action(
                     Ok(engine) => {
                         let engine = Arc::new(engine);
 
+                        // Step 1: Start tunnels
+                        app.push_bridge_log("Starting tunnels...".to_string());
                         let handles = engine.start_tunnels().await;
                         *tunnel_handles = handles;
 
+                        // Step 2: Start background services
                         engine.start_health_monitor();
                         engine.start_receive_loop();
                         engine.start_heartbeat();
                         engine.start_redis_subscriber_if_active();
 
+                        // Step 3: Handshake + activate session (no slave launch needed)
+                        // Commands execute directly via SSH → claude -p on each send.
                         {
                             let eng = engine.clone();
                             tokio::spawn(async move {
+                                // Handshake (best-effort)
                                 if let Err(e) = eng.send_handshake().await {
-                                    // Can't eprintln during TUI — logged via engine event
-                                    let _ = e;
+                                    let _ = eng.event_tx.send(BridgeEvent::Log(
+                                        format!("Handshake failed: {e}")
+                                    )).await;
                                 }
+
+                                // Activate session — commands execute on-demand via SSH
+                                let _ = eng.event_tx.send(BridgeEvent::ConnectionStatus(
+                                    "Connected".to_string()
+                                )).await;
+                                let _ = eng.event_tx.send(BridgeEvent::RoleConfirmed(
+                                    *eng.role.lock().await
+                                )).await;
+
+                                // Initial ping for RTT measurement
+                                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                                let _ = eng.send_ping().await;
                             });
                         }
 
                         *bridge_engine = Some(engine);
                         *event_rx = Some(rx);
                         app.connection_status = "Connecting...".to_string();
+                        app.session_status = "Activating...".to_string();
                         app.push_bridge_log("Bridge engine started".to_string());
                     }
                     Err(e) => {
@@ -239,8 +268,22 @@ async fn execute_action(
         InputAction::SendCommand(task) => {
             if let Some(engine) = bridge_engine {
                 let engine = engine.clone();
+                let task_clone = task.clone();
                 tokio::spawn(async move {
-                    let _ = engine.send_command(task).await;
+                    // Step 1: Record outbound message
+                    match engine.send_command(task_clone.clone()).await {
+                        Ok(msg_id) => {
+                            // Step 2: Execute on remote via SSH + claude -p
+                            let _ = engine.execute_remote_command(task_clone, msg_id).await;
+                        }
+                        Err(e) => {
+                            let _ = engine.event_tx.send(
+                                crate::bridge::engine::BridgeEvent::Log(
+                                    format!("Send failed: {e}")
+                                )
+                            ).await;
+                        }
+                    }
                 });
             }
             None
@@ -310,16 +353,18 @@ async fn execute_action(
                 }
             }
 
-            // Step 4: Create dirs + go to Bridge
+            // Step 4: Create dirs + wipe stale contents for fresh session
             app.push_setup_log("Creating directories...".to_string());
             match connection::setup_local_dirs(&app.settings) {
                 Ok(msg) => app.push_setup_log(msg),
                 Err(e) => app.push_setup_log(format!("Local dirs: {e}")),
             }
+            connection::cleanup_local_contents(&app.settings);
             match connection::setup_remote_dirs(&app.settings).await {
                 Ok(_) => app.push_setup_log("Remote dirs OK.".to_string()),
                 Err(e) => app.push_setup_log(format!("Remote dirs: {e} (continuing)")),
             }
+            connection::cleanup_remote_contents(&app.settings).await;
 
             app.active_transport = app.settings.active_transport;
             app.push_setup_log("=== Deploying Bridge ===".to_string());
@@ -337,7 +382,16 @@ fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                     app.setup_log_scroll = app.setup_log_scroll.saturating_sub(1);
                 }
                 Page::Bridge => {
-                    app.bridge_log_scroll = app.bridge_log_scroll.saturating_sub(1);
+                    // Determine which panel based on column position
+                    let width = crossterm::terminal::size().map(|(w, _)| w).unwrap_or(80);
+                    let half = width / 2;
+                    if mouse.column < half {
+                        app.outbox_scroll = app.outbox_scroll.saturating_sub(1);
+                        app.outbox_autoscroll = false;
+                    } else {
+                        app.inbox_scroll = app.inbox_scroll.saturating_sub(1);
+                        app.inbox_autoscroll = false;
+                    }
                 }
                 _ => {}
             }
@@ -348,7 +402,25 @@ fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                     app.setup_log_scroll = app.setup_log_scroll.saturating_add(1);
                 }
                 Page::Bridge => {
-                    app.bridge_log_scroll = app.bridge_log_scroll.saturating_add(1);
+                    let width = crossterm::terminal::size().map(|(w, _)| w).unwrap_or(80);
+                    let half = width / 2;
+                    if mouse.column < half {
+                        let count = app.messages.iter().filter(|m| m.direction == MessageDirection::Outbound).count();
+                        if count > 0 {
+                            app.outbox_scroll = (app.outbox_scroll + 1).min(count.saturating_sub(1));
+                            if app.outbox_scroll >= count.saturating_sub(1) {
+                                app.outbox_autoscroll = true;
+                            }
+                        }
+                    } else {
+                        let count = app.messages.iter().filter(|m| m.direction == MessageDirection::Inbound).count();
+                        if count > 0 {
+                            app.inbox_scroll = (app.inbox_scroll + 1).min(count.saturating_sub(1));
+                            if app.inbox_scroll >= count.saturating_sub(1) {
+                                app.inbox_autoscroll = true;
+                            }
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -463,11 +535,58 @@ fn process_bridge_event(app: &mut App, event: BridgeEvent) {
     match event {
         BridgeEvent::MessageSent(entry) => {
             app.messages.push(entry);
+            // Autoscroll outbox if enabled
+            if app.outbox_autoscroll {
+                let count = app.messages.iter().filter(|m| m.direction == MessageDirection::Outbound).count();
+                app.outbox_scroll = count.saturating_sub(1);
+            }
         }
         BridgeEvent::MessageReceived(entry) => {
             app.messages.push(entry);
+            // Autoscroll inbox if enabled
+            if app.inbox_autoscroll {
+                let count = app.messages.iter().filter(|m| m.direction == MessageDirection::Inbound).count();
+                app.inbox_scroll = count.saturating_sub(1);
+            }
         }
         BridgeEvent::CommandReceived(_msg) => {}
+        BridgeEvent::StreamChunk(resp_id, accumulated) => {
+            // Find existing streaming entry or create one
+            if let Some(entry) = app.messages.iter_mut().find(|m| m.msg_id == resp_id) {
+                entry.content_preview = accumulated;
+                entry.status = crate::app::DeliveryStatus::Streaming;
+            } else {
+                app.messages.push(crate::app::MessageEntry {
+                    msg_id: resp_id,
+                    timestamp: Utc::now().format("%H:%M:%S").to_string(),
+                    direction: MessageDirection::Inbound,
+                    content_preview: accumulated,
+                    status: crate::app::DeliveryStatus::Streaming,
+                });
+            }
+            if app.inbox_autoscroll {
+                let count = app.messages.iter().filter(|m| m.direction == MessageDirection::Inbound).count();
+                app.inbox_scroll = count.saturating_sub(1);
+            }
+        }
+        BridgeEvent::StreamComplete(resp_id, final_text) => {
+            if let Some(entry) = app.messages.iter_mut().find(|m| m.msg_id == resp_id) {
+                entry.content_preview = final_text;
+                entry.status = crate::app::DeliveryStatus::ReceivedReply;
+            } else {
+                app.messages.push(crate::app::MessageEntry {
+                    msg_id: resp_id,
+                    timestamp: Utc::now().format("%H:%M:%S").to_string(),
+                    direction: MessageDirection::Inbound,
+                    content_preview: final_text,
+                    status: crate::app::DeliveryStatus::ReceivedReply,
+                });
+            }
+            if app.inbox_autoscroll {
+                let count = app.messages.iter().filter(|m| m.direction == MessageDirection::Inbound).count();
+                app.inbox_scroll = count.saturating_sub(1);
+            }
+        }
         BridgeEvent::HealthUpdate(kind, healthy) => {
             let idx = match kind {
                 TransportKind::Rsync => 0,
@@ -485,14 +604,32 @@ fn process_bridge_event(app: &mut App, event: BridgeEvent) {
                 }
                 app.connection_status = status;
             } else {
-                app.connection_status = status.clone();
-                if status == "Disconnected" || status.contains("failed") {
-                    app.connected_at = None;
-                }
-                if app.session_status.starts_with("Active") {
-                    app.session_status = "Inactive".to_string();
+                // Don't let transient health-check failures overwrite a recent "Connected" state.
+                // Only apply failure status if we've been disconnected for > 5s or were never connected.
+                let should_apply = match app.connected_at {
+                    None => true,
+                    Some(t) => t.elapsed() > std::time::Duration::from_secs(5)
+                        && !app.connection_status.starts_with("Connected"),
+                };
+
+                if should_apply {
+                    app.connection_status = status.clone();
+                    if status == "Disconnected" || status.contains("failed") {
+                        app.connected_at = None;
+                    }
+                    if app.session_status.starts_with("Active") {
+                        app.session_status = "Inactive".to_string();
+                    }
                 }
             }
+        }
+        BridgeEvent::PingResult(rtt_ms) => {
+            app.last_ping_ms = Some(rtt_ms);
+            // PingResult also confirms connectivity — activate session if not already
+            if !app.session_status.starts_with("Active") {
+                app.session_status = "Active".to_string();
+            }
+            app.push_bridge_log(format!("Ping RTT: {}ms", rtt_ms));
         }
         BridgeEvent::StatusUpdate(msg_id, status) => {
             for msg in &mut app.messages {
@@ -516,6 +653,11 @@ fn process_bridge_event(app: &mut App, event: BridgeEvent) {
 }
 
 fn draw(frame: &mut Frame, app: &App) {
+    // Clear entire screen to prevent stale content from previous pages bleeding through.
+    // ratatui's double-buffer only redraws changed cells, so pages that don't cover
+    // the full area (e.g., switching from Setup's 2-panel layout to Bridge) leave artifacts.
+    frame.render_widget(ratatui::widgets::Clear, frame.area());
+
     match app.page {
         Page::Welcome => welcome::draw(frame, app),
         Page::Setup => setup::draw(frame, app),
@@ -985,9 +1127,11 @@ fn handle_bridge_input(app: &mut App, key: KeyCode, modifiers: KeyModifiers) -> 
             match app.bridge_focus {
                 BridgeFocus::Outbox => {
                     app.outbox_scroll = app.outbox_scroll.saturating_sub(1);
+                    app.outbox_autoscroll = false;
                 }
                 BridgeFocus::Inbox => {
                     app.inbox_scroll = app.inbox_scroll.saturating_sub(1);
+                    app.inbox_autoscroll = false;
                 }
                 BridgeFocus::Input => {
                     // Select message in outbox
@@ -1007,12 +1151,20 @@ fn handle_bridge_input(app: &mut App, key: KeyCode, modifiers: KeyModifiers) -> 
                     let count = app.messages.iter().filter(|m| m.direction == MessageDirection::Outbound).count();
                     if count > 0 {
                         app.outbox_scroll = (app.outbox_scroll + 1).min(count.saturating_sub(1));
+                        // Re-enable autoscroll if scrolled to bottom
+                        if app.outbox_scroll >= count.saturating_sub(1) {
+                            app.outbox_autoscroll = true;
+                        }
                     }
                 }
                 BridgeFocus::Inbox => {
                     let count = app.messages.iter().filter(|m| m.direction == MessageDirection::Inbound).count();
                     if count > 0 {
                         app.inbox_scroll = (app.inbox_scroll + 1).min(count.saturating_sub(1));
+                        // Re-enable autoscroll if scrolled to bottom
+                        if app.inbox_scroll >= count.saturating_sub(1) {
+                            app.inbox_autoscroll = true;
+                        }
                     }
                 }
                 BridgeFocus::Input => {

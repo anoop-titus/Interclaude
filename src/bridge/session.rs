@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
+use tokio::io::AsyncBufReadExt;
 use tokio::process::Command;
+use tokio::sync::mpsc;
 
 use crate::config::Settings;
 
@@ -12,7 +14,7 @@ pub async fn remote_claude_exec(settings: &Settings, task: &str) -> Result<Claud
     let escaped_task = task.replace('\'', "'\\''");
 
     let cmd = format!(
-        "cd {remote_dir} && claude -p '{escaped_task}' 2>&1"
+        "cd {remote_dir} && claude -p '{escaped_task}' < /dev/null 2>/dev/null"
     );
 
     let mut args = settings.ssh_args();
@@ -50,92 +52,95 @@ pub struct ClaudeExecResult {
     pub duration_ms: u64,
 }
 
-/// Launch the slave watcher daemon on the remote machine
-/// This starts a process that monitors the Slave/Inbox for new command files
-/// and executes them via `claude -p`
-pub async fn launch_slave_watcher(settings: &Settings) -> Result<tokio::process::Child> {
+/// Streaming variant: spawns SSH + `claude -p` and sends each line of stdout as it arrives.
+/// The sender receives accumulated text (not just the new line) so the TUI can replace-in-place.
+pub async fn remote_claude_exec_streaming(
+    settings: &Settings,
+    task: &str,
+    chunk_tx: mpsc::Sender<String>,
+) -> Result<ClaudeExecResult> {
     let dest = settings.ssh_destination();
     let remote_dir = &settings.remote_dir;
 
-    // The slave watcher script: monitors inbox, processes commands, writes responses to outbox
-    let watcher_script = format!(r#"
-cd {remote_dir}
-echo "Slave watcher started at $(date)"
-PROCESSED=""
+    let escaped_task = task.replace('\'', "'\\''");
 
-while true; do
-    for f in Slave/Inbox/*.json; do
-        [ -f "$f" ] || continue
+    // Use -tt to force PTY allocation so Claude's output is flushed line-by-line
+    let cmd = format!(
+        "cd {remote_dir} && claude -p '{escaped_task}' < /dev/null 2>/dev/null"
+    );
 
-        # Skip already processed
-        BASENAME=$(basename "$f")
-        echo "$PROCESSED" | grep -q "$BASENAME" && continue
+    let mut args = settings.ssh_args();
+    args.extend([
+        "-o".to_string(), "ConnectTimeout=10".to_string(),
+        "-tt".to_string(), // force PTY for line-buffered output
+        dest,
+        cmd,
+    ]);
 
-        # Check ledger
-        MSG_ID=$(python3 -c "import json,sys; print(json.load(open('$f'))['msg_id'])" 2>/dev/null || echo "")
-        if [ -n "$MSG_ID" ] && grep -q "$MSG_ID" .ledger 2>/dev/null; then
-            PROCESSED="$PROCESSED $BASENAME"
-            continue
-        fi
+    let start = std::time::Instant::now();
 
-        echo "Processing: $f"
+    let mut child = Command::new("ssh")
+        .args(&args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .context("Failed to spawn streaming remote Claude session")?;
 
-        # Extract task from command JSON
-        TASK=$(python3 -c "import json,sys; print(json.load(open('$f'))['payload']['task'])" 2>/dev/null || echo "")
+    let stdout = child.stdout.take().context("No stdout pipe")?;
+    let mut reader = tokio::io::BufReader::new(stdout);
+    let mut accumulated = String::new();
+    let mut line_buf = String::new();
 
-        if [ -z "$TASK" ]; then
-            echo "Could not parse task from $f"
-            PROCESSED="$PROCESSED $BASENAME"
-            continue
-        fi
+    loop {
+        line_buf.clear();
+        match reader.read_line(&mut line_buf).await {
+            Ok(0) => break, // EOF
+            Ok(_) => {
+                // Strip PTY carriage returns
+                let clean = line_buf.replace('\r', "");
+                accumulated.push_str(&clean);
+                // Best-effort send — if TUI is slow, skip this chunk
+                let _ = chunk_tx.try_send(accumulated.clone());
+            }
+            Err(e) => {
+                crate::logging::log(&format!("Stream read error: {e}"));
+                break;
+            }
+        }
+    }
 
-        # Execute via claude
-        RESPONSE=$(claude -p "$TASK" 2>&1)
-        EXIT_CODE=$?
+    let status = child.wait().await.context("Failed to wait for SSH process")?;
+    let duration_ms = start.elapsed().as_millis() as u64;
+    let exit_code = status.code().unwrap_or(-1);
 
-        # Write response to outbox
-        TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-        SEQ=$(echo "$BASENAME" | grep -o '[0-9]\{{4\}}' | head -1 || echo "0000")
-        RESP_FILE="Slave/Outbox/${{TIMESTAMP}}_${{SEQ}}_response.json"
+    Ok(ClaudeExecResult {
+        stdout: accumulated,
+        stderr: String::new(),
+        exit_code,
+        duration_ms,
+    })
+}
 
-        python3 -c "
-import json, datetime, uuid
-resp = {{
-    'msg_id': str(uuid.uuid4()),
-    'msg_type': 'response',
-    'timestamp': datetime.datetime.utcnow().isoformat() + 'Z',
-    'sequence': int('$SEQ'),
-    'sender_role': 'slave',
-    'transport_used': 'rsync',
-    'payload': {{
-        'reply_to': '$MSG_ID',
-        'stdout': '''$RESPONSE''',
-        'stderr': '',
-        'exit_code': $EXIT_CODE,
-        'files_modified': [],
-        'duration_ms': 0
-    }}
-}}
-json.dump(resp, open('$RESP_FILE', 'w'), indent=2)
-print(f'Response written to $RESP_FILE')
-"
+/// Launch `interclaude --slave` on the remote machine via SSH.
+/// The binary must already be installed at ~/.local/bin/interclaude on remote
+/// (done by the PushInstall step in setup).
+pub async fn launch_slave_watcher(settings: &Settings) -> Result<tokio::process::Child> {
+    let dest = settings.ssh_destination();
 
-        # Mark as processed
-        [ -n "$MSG_ID" ] && echo "$MSG_ID" >> .ledger
-        PROCESSED="$PROCESSED $BASENAME"
-    done
-
-    sleep 2
-done
-"#);
+    // Run the proper interclaude binary in slave mode on remote
+    // Use absolute path since ~/.local/bin may not be in remote PATH
+    let slave_cmd = "$HOME/.local/bin/interclaude --slave".to_string();
 
     let mut args = settings.ssh_args();
     args.extend([
         "-o".to_string(), "ConnectTimeout=10".to_string(),
         "-o".to_string(), "ServerAliveInterval=15".to_string(),
         "-o".to_string(), "ServerAliveCountMax=3".to_string(),
+        "-t".to_string(), "-t".to_string(), // force PTY so remote process dies when SSH drops
         dest,
-        watcher_script,
+        slave_cmd,
     ]);
 
     let child = Command::new("ssh")
@@ -144,7 +149,7 @@ done
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
         .spawn()
-        .context("Failed to launch slave watcher")?;
+        .context("Failed to launch interclaude --slave on remote")?;
 
     Ok(child)
 }

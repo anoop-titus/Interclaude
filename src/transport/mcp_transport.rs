@@ -190,7 +190,7 @@ impl McpServer {
 
             tokio::spawn(async move {
                 if let Err(e) = handle_mcp_connection(stream, inbox_dir, outbox_dir, pending).await {
-                    eprintln!("MCP connection error: {e}");
+                    crate::logging::log(&format!("MCP connection error: {e}"));
                 }
             });
         }
