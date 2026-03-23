@@ -1,5 +1,6 @@
 mod access_portal;
 mod bridge;
+mod error_overlay;
 mod setup;
 pub mod status_bar;
 mod welcome;
@@ -43,6 +44,9 @@ pub async fn run(app: &mut App) -> Result<()> {
         }
     }
 
+    // Process pending fixes from previous session
+    process_pending_fixes(app).await;
+
     // Check dependencies on startup
     check_dependencies(app).await;
 
@@ -73,6 +77,11 @@ async fn run_loop(
     // Channel for async API validation results
     let (validation_tx, mut validation_rx) = mpsc::channel::<Result<String, String>>(4);
 
+    // Channel for error analysis results (ERE)
+    let (analysis_tx, mut analysis_rx) =
+        mpsc::channel::<crate::error::analysis::AnalysisResult>(4);
+    let mut last_error_count: usize = 0;
+
     while app.running {
         // Increment frame counter (used for spinner animation, etc.)
         app.frame_count = app.frame_count.wrapping_add(1);
@@ -88,6 +97,39 @@ async fn run_loop(
         if let Ok(result) = validation_rx.try_recv() {
             app.api_validation_status = Some(result);
         }
+
+        // Process error analysis results (ERE)
+        if let Ok(analysis) = analysis_rx.try_recv() {
+            // Only show overlay if no overlay is already active
+            if app.active_error_overlay.is_none() {
+                app.active_error_overlay = Some(analysis);
+            }
+        }
+
+        // Check for new errors and trigger analysis if credentials configured
+        let current_error_count = app.error_store.all_recent().len();
+        if current_error_count > last_error_count
+            && app.active_error_overlay.is_none()
+            && app.credentials_saved
+            && !app.api_key_input.is_empty()
+        {
+            if let Some(latest_error) = app.error_store.latest() {
+                if latest_error.severity >= crate::error::ErrorSeverity::Error {
+                    let api_key = app.api_key_input.clone();
+                    let model = app.model_selection.model_id().to_string();
+                    let tx = analysis_tx.clone();
+                    tokio::spawn(async move {
+                        match crate::error::analysis::analyze_error(&latest_error, &api_key, &model).await {
+                            Ok(result) => { let _ = tx.send(result).await; }
+                            Err(e) => {
+                                crate::logging::log(&format!("[ERE] Analysis failed: {}", e));
+                            }
+                        }
+                    });
+                }
+            }
+        }
+        last_error_count = current_error_count;
 
         // Fire pending API validation
         if let Some((api_key, model)) = app.pending_api_validation.take() {
@@ -480,9 +522,78 @@ fn draw(frame: &mut Frame, app: &App) {
         Page::AccessPortal => access_portal::draw(frame, app),
         Page::Bridge => bridge::draw(frame, app),
     }
+
+    // Error overlay renders on top of any page
+    if let Some(ref analysis) = app.active_error_overlay {
+        error_overlay::draw(frame, analysis, frame.area());
+    }
 }
 
 async fn handle_input(app: &mut App, key: KeyCode, modifiers: KeyModifiers) -> InputAction {
+    // Error overlay intercepts all input when active
+    if app.active_error_overlay.is_some() {
+        match key {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                let analysis = app.active_error_overlay.take();
+                if let Some(analysis) = analysis {
+                    let fix_action = crate::error::correction::parse_fix_action(
+                        &analysis.suggested_action,
+                        analysis.original_error.category.label(),
+                    );
+
+                    match analysis.fix_type {
+                        crate::error::analysis::FixType::InSession => {
+                            app.push_bridge_log(format!("Applying fix: {}", fix_action.label()));
+                            // Map fix action to InputAction
+                            match &fix_action {
+                                crate::error::correction::FixAction::RetryConnection => {
+                                    // Will be handled as Activate or test
+                                    return InputAction::Activate;
+                                }
+                                crate::error::correction::FixAction::SwitchTransport(kind) => {
+                                    app.set_transport(*kind);
+                                    return InputAction::SwitchTransport(*kind);
+                                }
+                                crate::error::correction::FixAction::RestartBridge => {
+                                    return InputAction::StartBridge;
+                                }
+                                crate::error::correction::FixAction::RerunDepCheck => {
+                                    // Handled below — will trigger dep check
+                                    app.dep_check_complete = false;
+                                }
+                                _ => {
+                                    app.push_bridge_log(format!("Manual action needed: {}", fix_action.label()));
+                                }
+                            }
+                        }
+                        crate::error::analysis::FixType::OutOfSession => {
+                            let pending = crate::error::pending::PendingFix {
+                                fix_action,
+                                created_at: chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
+                                error_context: analysis.original_error.message.clone(),
+                                description: analysis.suggested_action.clone(),
+                            };
+                            match crate::error::pending::save_pending(&pending) {
+                                Ok(()) => app.push_bridge_log("Fix queued — will apply on next restart".to_string()),
+                                Err(e) => app.push_bridge_log(format!("Failed to queue fix: {}", e)),
+                            }
+                        }
+                    }
+                }
+                return InputAction::None;
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                app.active_error_overlay = None;
+                return InputAction::None;
+            }
+            KeyCode::Char('d') | KeyCode::Char('D') => {
+                app.show_error_details = !app.show_error_details;
+                return InputAction::None;
+            }
+            _ => return InputAction::None, // Absorb all other keys
+        }
+    }
+
     // On Bridge page, typing goes directly to the input bar
     if app.page == Page::Bridge && !modifiers.contains(KeyModifiers::CONTROL) {
         match key {
@@ -920,6 +1031,66 @@ fn handle_bridge_input(app: &mut App, key: KeyCode, modifiers: KeyModifiers) -> 
     }
 }
 
+/// Process any pending fixes from a previous session
+async fn process_pending_fixes(app: &mut App) {
+    match crate::error::pending::load_pending() {
+        Ok(fixes) if !fixes.is_empty() => {
+            let count = fixes.len();
+            crate::logging::log(&format!("[ERE] Processing {} pending fix(es)", count));
+
+            for fix in &fixes {
+                crate::logging::log(&format!("[ERE] Applying: {}", fix.description));
+                match &fix.fix_action {
+                    crate::error::correction::FixAction::UpdateConfig { field, value } => {
+                        // Apply config updates
+                        match field.as_str() {
+                            "remote_host" => app.settings.remote_host = value.clone(),
+                            "ssh_user" => app.settings.ssh_user = value.clone(),
+                            "ssh_port" => {
+                                if let Ok(port) = value.parse() {
+                                    app.settings.ssh_port = port;
+                                }
+                            }
+                            "key_path" => app.settings.key_path = value.clone(),
+                            "remote_dir" => app.settings.remote_dir = value.clone(),
+                            _ => crate::logging::log(&format!("[ERE] Unknown config field: {}", field)),
+                        }
+                        // Save updated config
+                        if let Err(e) = app.settings.save() {
+                            crate::logging::log(&format!("[ERE] Config save failed: {}", e));
+                        }
+                    }
+                    crate::error::correction::FixAction::InstallDep { name, command } => {
+                        crate::logging::log(&format!(
+                            "[ERE] Cannot auto-install {}. Run: {}", name, command
+                        ));
+                        app.setup_log.push(format!(
+                            "[ERE] Pending fix: install {} ({})", name, command
+                        ));
+                    }
+                    other => {
+                        crate::logging::log(&format!(
+                            "[ERE] Deferred action: {} — will apply when appropriate", other.label()
+                        ));
+                        app.setup_log.push(format!("[ERE] Startup fix: {}", other.label()));
+                    }
+                }
+            }
+
+            // Clear processed fixes
+            if let Err(e) = crate::error::pending::clear_pending() {
+                crate::logging::log(&format!("[ERE] Failed to clear pending fixes: {}", e));
+            }
+
+            app.setup_log.push(format!("[ERE] Applied {} startup fix(es)", count));
+        }
+        Ok(_) => {} // No pending fixes
+        Err(e) => {
+            crate::logging::log(&format!("[ERE] Failed to load pending fixes: {}", e));
+        }
+    }
+}
+
 async fn check_dependencies(app: &mut App) {
     // (name, check_cmd, install_hint, required)
     let deps: Vec<(&str, &str, &str, bool)> = vec![
@@ -974,6 +1145,11 @@ async fn check_dependencies(app: &mut App) {
             }
             Err(_) => (false, None),
         };
+
+        // Capture missing required deps to ERE
+        if !available && required {
+            app.push_welcome_error(name, hint);
+        }
 
         app.dep_checks.push(crate::app::DepCheck {
             name: name.to_string(),

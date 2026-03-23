@@ -1,6 +1,9 @@
+use std::sync::Arc;
+
 use anyhow::Result;
 
 use crate::config::Settings;
+use crate::error::logging::ErrorStore;
 use crate::transport::TransportKind;
 
 /// Which TUI page is active
@@ -336,6 +339,11 @@ pub struct App {
     pub api_validation_status: Option<Result<String, String>>, // Some(Ok("valid")) or Some(Err("reason"))
     pub pending_api_validation: Option<(String, String)>, // (api_key, model) — consumed by event loop
 
+    // Error Resolution Engine
+    pub error_store: Arc<ErrorStore>,
+    pub active_error_overlay: Option<crate::error::analysis::AnalysisResult>,
+    pub show_error_details: bool, // toggle detailed view in overlay
+
     // Tutorial panel
     pub tutorial_lines: Vec<String>,
 }
@@ -381,6 +389,9 @@ impl App {
             credentials_saved: false,
             api_validation_status: None,
             pending_api_validation: None,
+            error_store: Arc::new(ErrorStore::new()),
+            active_error_overlay: None,
+            show_error_details: false,
             tutorial_lines: vec![
                 "Pre-flight Installation Guide".to_string(),
                 "".to_string(),
@@ -456,21 +467,52 @@ impl App {
         self.ssh_test_passed
     }
 
-    /// Add to setup log + file log, auto-scroll to bottom
+    /// Add to setup log + file log, auto-scroll to bottom.
+    /// Automatically captures error-like messages to the ErrorStore.
     pub fn push_setup_log(&mut self, msg: String) {
         crate::logging::log(&format!("[SETUP] {msg}"));
+        if is_error_message(&msg) {
+            self.error_store.log(&crate::error::ErrorEntry::new(
+                crate::error::ErrorCategory::Setup,
+                classify_severity(&msg),
+                "setup",
+                &msg,
+                "",
+            ));
+        }
         self.setup_log.push(msg);
         self.setup_log_scroll = u16::MAX;
     }
 
-    /// Add to bridge log + file log, auto-scroll to bottom
+    /// Add to bridge log + file log, auto-scroll to bottom.
+    /// Automatically captures error-like messages to the ErrorStore.
     pub fn push_bridge_log(&mut self, msg: String) {
         crate::logging::log(&format!("[BRIDGE] {msg}"));
+        if is_error_message(&msg) {
+            self.error_store.log(&crate::error::ErrorEntry::new(
+                crate::error::ErrorCategory::Bridge,
+                classify_severity(&msg),
+                "bridge",
+                &msg,
+                "",
+            ));
+        }
         self.bridge_log.push(msg);
         if self.bridge_log.len() > 100 {
             self.bridge_log.drain(0..50);
         }
         self.bridge_log_scroll = u16::MAX;
+    }
+
+    /// Log an error from the Welcome page (dependency checks)
+    pub fn push_welcome_error(&self, dep_name: &str, install_hint: &str) {
+        self.error_store.log(&crate::error::ErrorEntry::new(
+            crate::error::ErrorCategory::Welcome,
+            crate::error::ErrorSeverity::Error,
+            "dependency_check",
+            format!("Required dependency missing: {}", dep_name),
+            format!("Install with: {}", install_hint),
+        ));
     }
 
     /// Whether Redis configuration should be shown (transport is Redis)
@@ -532,5 +574,24 @@ impl App {
             let hours = mins / 60;
             format!("{:02}:{:02}", hours, mins % 60)
         })
+    }
+}
+
+/// Check if a log message looks like an error
+fn is_error_message(msg: &str) -> bool {
+    let lower = msg.to_lowercase();
+    lower.contains("fail") || lower.contains("error") || lower.contains("abort")
+        || msg.starts_with("FAIL")
+}
+
+/// Classify error severity from message content
+fn classify_severity(msg: &str) -> crate::error::ErrorSeverity {
+    let lower = msg.to_lowercase();
+    if lower.contains("critical") || lower.contains("fatal") || lower.contains("abort") {
+        crate::error::ErrorSeverity::Critical
+    } else if lower.contains("fail") || lower.contains("error") {
+        crate::error::ErrorSeverity::Error
+    } else {
+        crate::error::ErrorSeverity::Warning
     }
 }

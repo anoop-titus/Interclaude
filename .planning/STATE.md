@@ -1,7 +1,7 @@
 # Project State
 
 ## Current Position
-Phase 12: Word Wrap + Access Portal — COMPLETE (all 3 plans executed)
+Phase 13: Error Resolution Engine — COMPLETE (all 3 plans executed)
 
 ## Accumulated Decisions
 - MOSH recommended over SSH (survives roaming, auto-reconnects)
@@ -21,16 +21,21 @@ Phase 12: Word Wrap + Access Portal — COMPLETE (all 3 plans executed)
 - Default model: Sonnet 4.6 (recommended balance of speed/capability)
 - Credential encryption: AES-256-GCM with machine-bound key derivation
 - Credentials not portable between machines (by design)
+- Error detection uses keyword matching on log messages
+- JSON-lines format for error storage (one file per category)
+- ERE analysis auto-triggers for errors with severity >= Error when credentials configured
+- Fix classification: keyword matching from natural language to concrete FixAction
+- Pending fixes stored as JSON array, processed on startup
 
 ## Deferred Issues
-- 35 compiler warnings (all "unused" — will reduce as features exercised)
+- 34 compiler warnings (all "unused" — will reduce as features exercised)
 - Mouse click offsets approximate (section headers shift rows)
 - Redis password stored as plaintext in config.toml (masked in UI only)
 - F6 pipeline toggle deferred (pipeline inside status panel, F5 covers both)
-- is_configured and CredentialConfig import unused (will be used by ERE in Phase 13)
+- OAuth access mode not implemented (only ApiKey works currently)
 
 ## Blockers/Concerns
 - None blocking
 
 ## Alignment
-Phase 12 complete. Word wrapping, Access Portal, credential storage all working. Ready for Phase 13 (ERE).
+Phase 13 complete. Full ERE pipeline: Error Logging → Analysis (Claude API) → Correction (in-session + startup). Ready for next milestone.

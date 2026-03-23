@@ -1,6 +1,9 @@
+mod api;
 mod app;
 mod bridge;
 mod config;
+pub mod error;
+pub mod logging;
 mod transport;
 mod tui;
 
@@ -31,6 +34,8 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    logging::init();
+
     let cli = Cli::parse();
 
     if cli.slave {
@@ -46,13 +51,13 @@ async fn main() -> Result<()> {
 
 /// Run in headless slave mode — monitors inbox and processes commands via claude -p
 async fn run_slave() -> Result<()> {
-    eprintln!("Interclaude slave mode starting...");
+    logging::log("Interclaude slave mode starting...");
 
     let mut settings = config::Settings::load();
     settings.role = Role::Slave;
 
     let base = settings.local_interclaude_dir();
-    eprintln!("Interclaude dir: {}", base.display());
+    logging::log(&format!("Interclaude dir: {}", base.display()));
 
     // Ensure directories exist
     bridge::connection::setup_local_dirs(&settings)?;
@@ -62,14 +67,8 @@ async fn run_slave() -> Result<()> {
     let engine = BridgeEngine::new(settings.clone(), event_tx)?;
     let engine = std::sync::Arc::new(engine);
 
-    // Start autossh tunnel if needed
-    let _tunnel = match engine.start_tunnel().await {
-        Ok(child) => child,
-        Err(e) => {
-            eprintln!("[WARN] Tunnel start failed: {e} (continuing without tunnel)");
-            None
-        }
-    };
+    // Start autossh tunnels (Redis + MCP) — on slave, these may fail (ports already in use locally) which is fine
+    let _tunnel_handles = engine.start_tunnels().await;
 
     // Start background tasks
     engine.start_health_monitor();
@@ -79,12 +78,25 @@ async fn run_slave() -> Result<()> {
     // Start Redis subscriber if active
     engine.start_redis_subscriber_if_active();
 
+    // Start MCP server so master can connect via SSH tunnel
+    let mcp_server = transport::mcp_transport::McpServer::new(
+        settings.mcp_port,
+        &base,
+        Role::Slave,
+    );
+    tokio::spawn(async move {
+        logging::log(&format!("MCP server listening on 0.0.0.0:{}", settings.mcp_port));
+        if let Err(e) = mcp_server.run().await {
+            logging::log(&format!("[ERR] MCP server failed: {e}"));
+        }
+    });
+
     // Send handshake proposal
     if let Err(e) = engine.send_handshake().await {
-        eprintln!("[WARN] Handshake failed: {e}");
+        logging::log(&format!("[WARN] Handshake failed: {e}"));
     }
 
-    eprintln!("Slave watcher running. Press Ctrl+C to stop.");
+    logging::log("Slave watcher running. Ctrl+C to stop.");
 
     // Process events from the engine
     loop {
@@ -98,11 +110,11 @@ async fn run_slave() -> Result<()> {
                             let msg_id = msg.msg_id.clone();
                             let engine = engine.clone();
 
-                            eprintln!("[EXEC] Processing command: {}", if task.len() > 60 {
+                            logging::log(&format!("[EXEC] Processing command: {}", if task.len() > 60 {
                                 format!("{}...", &task[..57])
                             } else {
                                 task.clone()
-                            });
+                            }));
 
                             // Execute in background so we don't block the event loop
                             tokio::spawn(async move {
@@ -127,7 +139,7 @@ async fn run_slave() -> Result<()> {
                                         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
                                         let exit_code = output.status.code().unwrap_or(-1);
 
-                                        eprintln!("[EXEC] Command completed (exit={}, {}ms)", exit_code, duration_ms);
+                                        logging::log(&format!("[EXEC] Command completed (exit={}, {}ms)", exit_code, duration_ms));
 
                                         // Send EXECUTED status
                                         let _ = engine.send_status_update(&msg_id, app::DeliveryStatus::Executed).await;
@@ -139,11 +151,11 @@ async fn run_slave() -> Result<()> {
                                         if let Err(e) = engine.send_response(
                                             &msg_id, stdout, stderr, exit_code, duration_ms
                                         ).await {
-                                            eprintln!("[ERR] Failed to send response: {e}");
+                                            logging::log(&format!("[ERR] Failed to send response: {e}"));
                                         }
                                     }
                                     Err(e) => {
-                                        eprintln!("[ERR] claude -p failed: {e}");
+                                        logging::log(&format!("[ERR] claude -p failed: {e}"));
                                         let _ = engine.send_response(
                                             &msg_id,
                                             String::new(),
@@ -157,28 +169,28 @@ async fn run_slave() -> Result<()> {
                         }
                     }
                     BridgeEvent::MessageReceived(entry) => {
-                        eprintln!("[RECV] {} - {}", entry.timestamp, entry.content_preview);
+                        logging::log(&format!("[RECV] {} - {}", entry.timestamp, entry.content_preview));
                     }
                     BridgeEvent::MessageSent(entry) => {
-                        eprintln!("[SENT] {} - {}", entry.timestamp, entry.content_preview);
+                        logging::log(&format!("[SENT] {} - {}", entry.timestamp, entry.content_preview));
                     }
                     BridgeEvent::HealthUpdate(kind, healthy) => {
-                        eprintln!("[HEALTH] {}: {}", kind.label(), if healthy { "UP" } else { "DOWN" });
+                        logging::log(&format!("[HEALTH] {}: {}", kind.label(), if healthy { "UP" } else { "DOWN" }));
                     }
                     BridgeEvent::ConnectionStatus(status) => {
-                        eprintln!("[STATUS] {}", status);
+                        logging::log(&format!("[STATUS] {}", status));
                     }
                     BridgeEvent::RoleConfirmed(role) => {
-                        eprintln!("[ROLE] Confirmed as {:?}", role);
+                        logging::log(&format!("[ROLE] Confirmed as {:?}", role));
                     }
                     BridgeEvent::Log(msg) => {
-                        eprintln!("[LOG] {}", msg);
+                        logging::log(&format!("[LOG] {}", msg));
                     }
                     _ => {}
                 }
             }
             _ = tokio::signal::ctrl_c() => {
-                eprintln!("\nShutting down slave...");
+                logging::log(&format!("\nShutting down slave..."));
                 break;
             }
         }
