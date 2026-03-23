@@ -1,7 +1,7 @@
 <p align="center">
   <pre align="center">
   ╦╔╗╔╔╦╗╔═╗╦═╗╔═╗╦  ╔═╗╦ ╦╔╦╗╔═╗
-  ║║║║ ║ ║╣ ╠╦╝║  ║  ╠═╣║ ║ ║║║╣
+ ║║║║ ║ ║╣ ╠╦╝║  ║  ╠═╣║ ║ ║║║╣
   ╩╝╚╝ ╩ ╚═╝╩╚═╚═╝╩═╝╩ ╩╚═╝═╩╝╚═╝
   </pre>
   <strong>Bridge Claude Code across machines. One terminal. Zero friction.</strong>
@@ -16,8 +16,7 @@
 
 ---
 
-<!-- Generate demo GIF: vhs demo.tape (requires VHS + headless Chrome) -->
-<!-- ![Demo](assets/demo.gif) -->
+![Demo](assets/demo.gif)
 
 ## Why Interclaude?
 

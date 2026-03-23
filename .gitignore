@@ -4,7 +4,6 @@
 .planning/
 .tldr/
 .tldrignore
-assets/
 *.pem
 *.key
 .env
