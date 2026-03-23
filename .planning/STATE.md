@@ -1,7 +1,7 @@
 # Project State
 
 ## Current Position
-Phase 11: TUI/UX Redesign — COMPLETE (all 5 plans executed)
+Phase 12: Word Wrap + Access Portal — COMPLETE (all 3 plans executed)
 
 ## Accumulated Decisions
 - MOSH recommended over SSH (survives roaming, auto-reconnects)
@@ -16,15 +16,21 @@ Phase 11: TUI/UX Redesign — COMPLETE (all 5 plans executed)
 - Esc = back (never quit); Ctrl+Q/Ctrl+C = quit
 - Transport recommendation is passive (suggest, never auto-switch)
 - Auto-collapse panels on small terminals (< 20 rows)
+- Box-constrained text selection NOT possible (terminal limitation, not app)
+- Default access mode: ApiKey (most common for CLI users)
+- Default model: Sonnet 4.6 (recommended balance of speed/capability)
+- Credential encryption: AES-256-GCM with machine-bound key derivation
+- Credentials not portable between machines (by design)
 
 ## Deferred Issues
-- 32 compiler warnings (all "unused") — will reduce as features exercised
+- 35 compiler warnings (all "unused" — will reduce as features exercised)
 - Mouse click offsets approximate (section headers shift rows)
 - Redis password stored as plaintext in config.toml (masked in UI only)
 - F6 pipeline toggle deferred (pipeline inside status panel, F5 covers both)
+- is_configured and CredentialConfig import unused (will be used by ERE in Phase 13)
 
 ## Blockers/Concerns
 - None blocking
 
 ## Alignment
-Phase 11 complete. All 3 TUI pages redesigned. Ready for next milestone.
+Phase 12 complete. Word wrapping, Access Portal, credential storage all working. Ready for Phase 13 (ERE).

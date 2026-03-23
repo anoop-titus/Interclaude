@@ -156,26 +156,62 @@ fn draw_messages(frame: &mut Frame, app: &App, area: Rect) {
     let outbox_focused = app.bridge_focus == BridgeFocus::Outbox;
     let inbox_focused = app.bridge_focus == BridgeFocus::Inbox;
 
+    // Available content width (subtract borders + padding)
+    let outbox_content_width = outbox_area.width.saturating_sub(2) as usize;
+    let inbox_content_width = inbox_area.width.saturating_sub(2) as usize;
+
     // Outbox (sent)
     let outbox_msgs: Vec<&crate::app::MessageEntry> = app.messages.iter()
         .filter(|m| m.direction == MessageDirection::Outbound)
         .collect();
 
     let outbox_items: Vec<ListItem> = if outbox_msgs.is_empty() {
-        vec![ListItem::new(Line::from(Span::styled(
-            " No tasks sent yet. Type below to send your first task.",
-            Style::default().fg(Color::DarkGray),
-        )))]
+        vec![ListItem::new(
+            wrap_message_text(
+                " No tasks sent yet. Type below to send your first task.",
+                outbox_content_width,
+                Style::default().fg(Color::DarkGray),
+            )
+        )]
     } else {
         outbox_msgs.iter().map(|m| {
-            let line = Line::from(vec![
-                Span::styled("You → ", Style::default().fg(Color::Cyan).bold()),
-                Span::styled(format!("[{}] ", m.status.symbol()), status_color(&m.status)),
-                Span::styled(&m.timestamp, Style::default().fg(Color::DarkGray)),
-                Span::raw(" "),
-                Span::styled(&m.content_preview, Style::default().fg(Color::White)),
-            ]);
-            ListItem::new(line)
+            let prefix = format!("You → [{}] {} ", m.status.symbol(), m.timestamp);
+            let prefix_len = prefix.len();
+            let content = &m.content_preview;
+            let full_text = format!("{}{}", prefix, content);
+
+            let lines = wrap_to_lines(&full_text, outbox_content_width);
+            let mut styled_lines: Vec<Line> = Vec::new();
+
+            for (i, line_text) in lines.iter().enumerate() {
+                if i == 0 {
+                    // First line: styled prefix + content start
+                    let mut spans = vec![
+                        Span::styled("You → ", Style::default().fg(Color::Cyan).bold()),
+                        Span::styled(format!("[{}] ", m.status.symbol()), status_color(&m.status)),
+                        Span::styled(&m.timestamp, Style::default().fg(Color::DarkGray)),
+                        Span::raw(" "),
+                    ];
+                    // Content portion of first line
+                    let content_start = if line_text.len() > prefix_len {
+                        &line_text[prefix_len..]
+                    } else {
+                        ""
+                    };
+                    if !content_start.is_empty() {
+                        spans.push(Span::styled(content_start.to_string(), Style::default().fg(Color::White)));
+                    }
+                    styled_lines.push(Line::from(spans));
+                } else {
+                    // Continuation lines: indented content
+                    styled_lines.push(Line::from(Span::styled(
+                        format!("       {}", line_text),
+                        Style::default().fg(Color::White),
+                    )));
+                }
+            }
+
+            ListItem::new(Text::from(styled_lines))
         }).collect()
     };
 
@@ -203,20 +239,49 @@ fn draw_messages(frame: &mut Frame, app: &App, area: Rect) {
         .collect();
 
     let inbox_items: Vec<ListItem> = if inbox_msgs.is_empty() {
-        vec![ListItem::new(Line::from(Span::styled(
-            " Waiting for remote Claude to respond...",
-            Style::default().fg(Color::DarkGray),
-        )))]
+        vec![ListItem::new(
+            wrap_message_text(
+                " Waiting for remote Claude to respond...",
+                inbox_content_width,
+                Style::default().fg(Color::DarkGray),
+            )
+        )]
     } else {
         inbox_msgs.iter().map(|m| {
-            let line = Line::from(vec![
-                Span::styled("Remote → ", Style::default().fg(Color::Green).bold()),
-                Span::styled(format!("[{}] ", m.status.symbol()), status_color(&m.status)),
-                Span::styled(&m.timestamp, Style::default().fg(Color::DarkGray)),
-                Span::raw(" "),
-                Span::styled(&m.content_preview, Style::default().fg(Color::Green)),
-            ]);
-            ListItem::new(line)
+            let prefix = format!("Remote → [{}] {} ", m.status.symbol(), m.timestamp);
+            let prefix_len = prefix.len();
+            let content = &m.content_preview;
+            let full_text = format!("{}{}", prefix, content);
+
+            let lines = wrap_to_lines(&full_text, inbox_content_width);
+            let mut styled_lines: Vec<Line> = Vec::new();
+
+            for (i, line_text) in lines.iter().enumerate() {
+                if i == 0 {
+                    let mut spans = vec![
+                        Span::styled("Remote → ", Style::default().fg(Color::Green).bold()),
+                        Span::styled(format!("[{}] ", m.status.symbol()), status_color(&m.status)),
+                        Span::styled(&m.timestamp, Style::default().fg(Color::DarkGray)),
+                        Span::raw(" "),
+                    ];
+                    let content_start = if line_text.len() > prefix_len {
+                        &line_text[prefix_len..]
+                    } else {
+                        ""
+                    };
+                    if !content_start.is_empty() {
+                        spans.push(Span::styled(content_start.to_string(), Style::default().fg(Color::Green)));
+                    }
+                    styled_lines.push(Line::from(spans));
+                } else {
+                    styled_lines.push(Line::from(Span::styled(
+                        format!("          {}", line_text),
+                        Style::default().fg(Color::Green),
+                    )));
+                }
+            }
+
+            ListItem::new(Text::from(styled_lines))
         }).collect()
     };
 
@@ -286,6 +351,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     let health = Paragraph::new(health_lines)
+        .wrap(Wrap { trim: true })
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -349,6 +415,7 @@ fn draw_input_bar(frame: &mut Frame, app: &App, area: Rect) {
     };
 
     let input_widget = Paragraph::new(display_text)
+        .wrap(Wrap { trim: false })
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -471,6 +538,7 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect) {
     frame.render_widget(Clear, overlay_area);
 
     let overlay = Paragraph::new(help_lines)
+        .wrap(Wrap { trim: true })
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -482,6 +550,52 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect) {
 }
 
 // ---- Helpers ----
+
+/// Wrap a plain text string into lines that fit within `max_width` characters.
+/// Breaks on word boundaries when possible, hard-breaks long words.
+fn wrap_to_lines(text: &str, max_width: usize) -> Vec<String> {
+    if max_width == 0 {
+        return vec![text.to_string()];
+    }
+    if text.len() <= max_width {
+        return vec![text.to_string()];
+    }
+
+    let mut lines = Vec::new();
+    let mut remaining = text;
+
+    while !remaining.is_empty() {
+        if remaining.len() <= max_width {
+            lines.push(remaining.to_string());
+            break;
+        }
+
+        // Find last space within max_width for word-boundary break
+        let break_at = remaining[..max_width]
+            .rfind(' ')
+            .unwrap_or(max_width); // hard-break if no space found
+
+        let break_at = if break_at == 0 { max_width } else { break_at };
+
+        lines.push(remaining[..break_at].to_string());
+        remaining = remaining[break_at..].trim_start();
+    }
+
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+/// Wrap a single message string into a multi-line Text with consistent style
+fn wrap_message_text(text: &str, max_width: usize, style: Style) -> Text<'static> {
+    let lines = wrap_to_lines(text, max_width);
+    Text::from(
+        lines.into_iter()
+            .map(|l| Line::from(Span::styled(l, style)))
+            .collect::<Vec<_>>()
+    )
+}
 
 fn truncate_str(s: &str, max: usize) -> String {
     if max == 0 {

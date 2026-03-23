@@ -41,3 +41,11 @@ dirs = "6"
 
 # Hostname for machine identification
 hostname = "0.4"
+
+# Encryption (credential storage)
+aes-gcm = "0.10"
+base64 = "0.22"
+rand = "0.8"
+
+# HTTP client (API validation, ERE)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

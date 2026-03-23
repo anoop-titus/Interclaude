@@ -8,7 +8,99 @@ use crate::transport::TransportKind;
 pub enum Page {
     Welcome,
     Setup,
+    AccessPortal,
     Bridge,
+}
+
+/// Authentication mode for Anthropic API
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessMode {
+    OAuth,
+    ApiKey,
+}
+
+impl AccessMode {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::OAuth => "OAuth (browser-based)",
+            Self::ApiKey => "API Key (direct)",
+        }
+    }
+
+    pub fn cycle(&self) -> Self {
+        match self {
+            Self::OAuth => Self::ApiKey,
+            Self::ApiKey => Self::OAuth,
+        }
+    }
+}
+
+/// Model selection for ERE
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelChoice {
+    Sonnet46,
+    Opus46,
+    Haiku45,
+}
+
+impl ModelChoice {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Sonnet46 => "Claude Sonnet 4.6 (default)",
+            Self::Opus46 => "Claude Opus 4.6",
+            Self::Haiku45 => "Claude Haiku 4.5",
+        }
+    }
+
+    pub fn model_id(&self) -> &'static str {
+        match self {
+            Self::Sonnet46 => "claude-sonnet-4-6",
+            Self::Opus46 => "claude-opus-4-6",
+            Self::Haiku45 => "claude-haiku-4-5-20251001",
+        }
+    }
+
+    pub fn cycle(&self) -> Self {
+        match self {
+            Self::Sonnet46 => Self::Opus46,
+            Self::Opus46 => Self::Haiku45,
+            Self::Haiku45 => Self::Sonnet46,
+        }
+    }
+}
+
+/// Which field is focused on the Access Portal page
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessPortalField {
+    AccessMode,
+    ApiKey,
+    Model,
+}
+
+impl AccessPortalField {
+    pub fn next(&self, show_api_key: bool) -> Self {
+        match self {
+            Self::AccessMode => {
+                if show_api_key { Self::ApiKey } else { Self::Model }
+            }
+            Self::ApiKey => Self::Model,
+            Self::Model => Self::AccessMode,
+        }
+    }
+
+    pub fn prev(&self, show_api_key: bool) -> Self {
+        match self {
+            Self::AccessMode => Self::Model,
+            Self::ApiKey => Self::AccessMode,
+            Self::Model => {
+                if show_api_key { Self::ApiKey } else { Self::AccessMode }
+            }
+        }
+    }
+
+    pub fn is_selector(&self) -> bool {
+        matches!(self, Self::AccessMode | Self::Model)
+    }
 }
 
 /// Delivery status for a single message
@@ -235,6 +327,15 @@ pub struct App {
     // Command input (always visible on Bridge page)
     pub compose_input: String,
 
+    // Access Portal state
+    pub access_mode: AccessMode,
+    pub api_key_input: String,
+    pub model_selection: ModelChoice,
+    pub access_portal_field: AccessPortalField,
+    pub credentials_saved: bool,
+    pub api_validation_status: Option<Result<String, String>>, // Some(Ok("valid")) or Some(Err("reason"))
+    pub pending_api_validation: Option<(String, String)>, // (api_key, model) — consumed by event loop
+
     // Tutorial panel
     pub tutorial_lines: Vec<String>,
 }
@@ -273,6 +374,13 @@ impl App {
             show_help_overlay: false,
             connected_at: None,
             compose_input: String::new(),
+            access_mode: AccessMode::ApiKey,
+            api_key_input: String::new(),
+            model_selection: ModelChoice::Sonnet46,
+            access_portal_field: AccessPortalField::AccessMode,
+            credentials_saved: false,
+            api_validation_status: None,
+            pending_api_validation: None,
             tutorial_lines: vec![
                 "Pre-flight Installation Guide".to_string(),
                 "".to_string(),
@@ -319,7 +427,8 @@ impl App {
     pub fn next_page(&mut self) {
         self.page = match self.page {
             Page::Welcome => Page::Setup,
-            Page::Setup => Page::Bridge,
+            Page::Setup => Page::AccessPortal,
+            Page::AccessPortal => Page::Bridge,
             Page::Bridge => Page::Bridge,
         };
     }
@@ -328,7 +437,8 @@ impl App {
         self.page = match self.page {
             Page::Welcome => Page::Welcome,
             Page::Setup => Page::Welcome,
-            Page::Bridge => Page::Setup,
+            Page::AccessPortal => Page::Setup,
+            Page::Bridge => Page::AccessPortal,
         };
     }
 
@@ -384,8 +494,14 @@ impl App {
         vec![
             ("Welcome", Page::Welcome, true),
             ("Setup", Page::Setup, true),
+            ("Access", Page::AccessPortal, true),
             ("Bridge", Page::Bridge, self.ssh_test_passed),
         ]
+    }
+
+    /// Whether the API key field should be shown (access mode is ApiKey)
+    pub fn show_api_key_field(&self) -> bool {
+        self.access_mode == AccessMode::ApiKey
     }
 
     /// Recalculate transport recommendation based on health

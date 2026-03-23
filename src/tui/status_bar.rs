@@ -97,6 +97,7 @@ pub fn draw_global_status(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     let bar = Paragraph::new(Line::from(spans))
+        .wrap(Wrap { trim: true })
         .block(
             Block::default()
                 .borders(Borders::BOTTOM)

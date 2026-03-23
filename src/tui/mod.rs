@@ -1,3 +1,4 @@
+mod access_portal;
 mod bridge;
 mod setup;
 pub mod status_bar;
@@ -15,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-use crate::app::{App, BridgeFocus, MessageDirection, Page, SetupField};
+use crate::app::{AccessPortalField, App, BridgeFocus, MessageDirection, Page, SetupField};
 use crate::bridge::connection;
 use crate::bridge::engine::{BridgeEngine, BridgeEvent};
 use crate::transport::TransportKind;
@@ -23,6 +24,24 @@ use crate::transport::TransportKind;
 pub async fn run(app: &mut App) -> Result<()> {
     // Load saved config
     app.settings = crate::config::Settings::load();
+
+    // Restore credential state from saved config
+    app.access_mode = match app.settings.credentials.access_mode.as_str() {
+        "oauth" => crate::app::AccessMode::OAuth,
+        _ => crate::app::AccessMode::ApiKey,
+    };
+    app.model_selection = match app.settings.credentials.model.as_str() {
+        "claude-opus-4-6" => crate::app::ModelChoice::Opus46,
+        "claude-haiku-4-5-20251001" => crate::app::ModelChoice::Haiku45,
+        _ => crate::app::ModelChoice::Sonnet46,
+    };
+    // Decrypt API key if saved
+    if let Ok(key) = app.settings.credentials.get_api_key() {
+        if !key.is_empty() {
+            app.api_key_input = key;
+            app.credentials_saved = true;
+        }
+    }
 
     // Check dependencies on startup
     check_dependencies(app).await;
@@ -51,6 +70,9 @@ async fn run_loop(
     // Keep tunnel handle alive so it doesn't get dropped
     let mut _tunnel_handles: Vec<tokio::process::Child> = Vec::new();
 
+    // Channel for async API validation results
+    let (validation_tx, mut validation_rx) = mpsc::channel::<Result<String, String>>(4);
+
     while app.running {
         // Increment frame counter (used for spinner animation, etc.)
         app.frame_count = app.frame_count.wrapping_add(1);
@@ -60,6 +82,20 @@ async fn run_loop(
             while let Ok(evt) = rx.try_recv() {
                 process_bridge_event(app, evt);
             }
+        }
+
+        // Process API validation results
+        if let Ok(result) = validation_rx.try_recv() {
+            app.api_validation_status = Some(result);
+        }
+
+        // Fire pending API validation
+        if let Some((api_key, model)) = app.pending_api_validation.take() {
+            let tx = validation_tx.clone();
+            tokio::spawn(async move {
+                let result = crate::config::credentials::validate_api_key(&api_key, &model).await;
+                let _ = tx.send(result.map_err(|e| e.to_string())).await;
+            });
         }
 
         // Auto-advance timer on Welcome page
@@ -336,6 +372,9 @@ fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
                         }
                     }
                 }
+                Page::AccessPortal => {
+                    // Click handling for access portal form fields (approximate)
+                }
                 Page::Bridge => {
                     // Click on transport selector (row ~4-6, the header area)
                     // Transport labels are in the header at row ~4
@@ -438,6 +477,7 @@ fn draw(frame: &mut Frame, app: &App) {
     match app.page {
         Page::Welcome => welcome::draw(frame, app),
         Page::Setup => setup::draw(frame, app),
+        Page::AccessPortal => access_portal::draw(frame, app),
         Page::Bridge => bridge::draw(frame, app),
     }
 }
@@ -522,6 +562,10 @@ async fn handle_input(app: &mut App, key: KeyCode, modifiers: KeyModifiers) -> I
                 InputAction::None
             }
             Page::Setup => handle_setup_input(app, key, modifiers).await,
+            Page::AccessPortal => {
+                handle_access_portal_input(app, key, modifiers);
+                InputAction::None
+            }
             Page::Bridge => handle_bridge_input(app, key, modifiers),
         },
     }
@@ -689,6 +733,108 @@ async fn handle_setup_input(app: &mut App, key: KeyCode, modifiers: KeyModifiers
     }
 
     InputAction::None
+}
+
+fn handle_access_portal_input(app: &mut App, key: KeyCode, modifiers: KeyModifiers) {
+    // Ctrl keybindings
+    if modifiers.contains(KeyModifiers::CONTROL) {
+        match key {
+            KeyCode::Char('v') => {
+                if app.api_key_input.is_empty() {
+                    app.api_validation_status = Some(Err("No API key entered".to_string()));
+                } else {
+                    // Save credentials first
+                    app.settings.credentials.access_mode = match app.access_mode {
+                        crate::app::AccessMode::OAuth => "oauth".to_string(),
+                        crate::app::AccessMode::ApiKey => "apikey".to_string(),
+                    };
+                    app.settings.credentials.model = app.model_selection.model_id().to_string();
+                    if let Err(e) = app.settings.credentials.set_api_key(&app.api_key_input) {
+                        app.api_validation_status = Some(Err(format!("Encryption failed: {}", e)));
+                        return;
+                    }
+                    if let Err(e) = app.settings.save() {
+                        app.api_validation_status = Some(Err(format!("Save failed: {}", e)));
+                        return;
+                    }
+                    app.credentials_saved = true;
+                    app.api_validation_status = Some(Ok("Validating with Anthropic API...".to_string()));
+
+                    // Fire async validation
+                    let api_key = app.api_key_input.clone();
+                    let model = app.model_selection.model_id().to_string();
+                    // We can't await here since this isn't async — store pending validation
+                    app.pending_api_validation = Some((api_key, model));
+                }
+                return;
+            }
+            KeyCode::Char('s') => {
+                // Ctrl+S = Save credentials without validation
+                app.settings.credentials.access_mode = match app.access_mode {
+                    crate::app::AccessMode::OAuth => "oauth".to_string(),
+                    crate::app::AccessMode::ApiKey => "apikey".to_string(),
+                };
+                app.settings.credentials.model = app.model_selection.model_id().to_string();
+                if let Err(e) = app.settings.credentials.set_api_key(&app.api_key_input) {
+                    app.api_validation_status = Some(Err(format!("Encryption failed: {}", e)));
+                    return;
+                }
+                match app.settings.save() {
+                    Ok(()) => {
+                        app.credentials_saved = true;
+                        app.api_validation_status = Some(Ok("Credentials saved".to_string()));
+                    }
+                    Err(e) => {
+                        app.api_validation_status = Some(Err(format!("Save failed: {}", e)));
+                    }
+                }
+                return;
+            }
+            _ => {}
+        }
+    }
+
+    match key {
+        KeyCode::Tab | KeyCode::Down => {
+            let show_key = app.show_api_key_field();
+            app.access_portal_field = app.access_portal_field.next(show_key);
+        }
+        KeyCode::BackTab | KeyCode::Up => {
+            let show_key = app.show_api_key_field();
+            app.access_portal_field = app.access_portal_field.prev(show_key);
+        }
+        KeyCode::Enter => {
+            match app.access_portal_field {
+                AccessPortalField::AccessMode => {
+                    app.access_mode = app.access_mode.cycle();
+                    // If switching away from ApiKey mode, snap focus away from ApiKey field
+                    if !app.show_api_key_field() && app.access_portal_field == AccessPortalField::ApiKey {
+                        app.access_portal_field = AccessPortalField::Model;
+                    }
+                }
+                AccessPortalField::Model => {
+                    app.model_selection = app.model_selection.cycle();
+                }
+                AccessPortalField::ApiKey => {
+                    // Enter on API key field moves to next field
+                    app.access_portal_field = AccessPortalField::Model;
+                }
+            }
+        }
+        KeyCode::Char(c) => {
+            if app.access_portal_field == AccessPortalField::ApiKey {
+                app.api_key_input.push(c);
+                app.api_validation_status = None; // clear validation on edit
+            }
+        }
+        KeyCode::Backspace => {
+            if app.access_portal_field == AccessPortalField::ApiKey {
+                app.api_key_input.pop();
+                app.api_validation_status = None;
+            }
+        }
+        _ => {}
+    }
 }
 
 fn handle_bridge_input(app: &mut App, key: KeyCode, modifiers: KeyModifiers) -> InputAction {

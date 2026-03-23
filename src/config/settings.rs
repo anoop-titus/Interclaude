@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::transport::TransportKind;
+use super::credentials::CredentialConfig;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
@@ -17,6 +18,8 @@ pub struct Settings {
     pub redis: RedisConfig,
     pub mcp_port: u16,
     pub message_timeout_secs: u64,
+    #[serde(default)]
+    pub credentials: CredentialConfig,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -77,6 +80,7 @@ impl Default for Settings {
             },
             mcp_port: 9876,
             message_timeout_secs: 300,
+            credentials: CredentialConfig::default(),
         }
     }
 }
@@ -99,9 +103,9 @@ impl Settings {
             match std::fs::read_to_string(&path) {
                 Ok(content) => match toml::from_str(&content) {
                     Ok(settings) => return settings,
-                    Err(e) => eprintln!("Config parse error: {e}"),
+                    Err(e) => crate::logging::log(&format!("Config parse error: {e}")),
                 },
-                Err(e) => eprintln!("Config read error: {e}"),
+                Err(e) => crate::logging::log(&format!("Config read error: {e}")),
             }
         }
         Self::default()
@@ -143,6 +147,7 @@ impl Settings {
     /// Build SSH command base args
     pub fn ssh_args(&self) -> Vec<String> {
         let mut args = vec![
+            "-F".to_string(), "/dev/null".to_string(), // skip ~/.ssh/config (avoids Colima/OrbStack unsupported options)
             "-o".to_string(), "StrictHostKeyChecking=accept-new".to_string(),
             "-p".to_string(), self.ssh_port.to_string(),
         ];
