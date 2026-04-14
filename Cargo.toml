@@ -45,7 +45,7 @@ hostname = "0.4"
 # Encryption (credential storage)
 aes-gcm = "0.10"
 base64 = "0.22"
-rand = "0.8"
+rand = "0.9"
 
 # HTTP client (API validation, ERE)
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
